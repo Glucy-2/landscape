@@ -17,14 +17,14 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: ubuntu-22.04
+          - host: ubuntu-26.04
             architecture: x86_64
             target: x86_64-unknown-linux-gnu
             toolchain: 1.98.0
             bindgen: false
             gateway: true
 
-          - host: ubuntu-22.04-arm
+          - host: ubuntu-26.04-arm
             architecture: aarch64
             target: aarch64-unknown-linux-gnu
             toolchain: 1.98.0
@@ -113,7 +113,7 @@ jobs:
   #     cross toolchains and from-source zlib/elfutils builds
   linux-cross-build:
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/build'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -206,7 +206,7 @@ jobs:
           path: output/*
   build-front:
     needs: linux-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout code
@@ -267,11 +267,11 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: ubuntu-22.04
+          - host: ubuntu-26.04
             architecture: x86_64
             target: x86_64-unknown-linux-gnu
 
-          - host: ubuntu-22.04-arm
+          - host: ubuntu-26.04-arm
             architecture: aarch64
             target: aarch64-unknown-linux-gnu
 
@@ -282,7 +282,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg-dev binutils unzip libelf1 zlib1g
+          sudo apt-get install -y dpkg-dev binutils unzip libelf1t64 zlib1g
 
       - name: Download binary
         uses: actions/download-artifact@v8
@@ -318,7 +318,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: [linux-build, linux-cross-build, build-front, package-deb]
 
     steps:
