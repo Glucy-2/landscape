@@ -17,14 +17,14 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: ubuntu-26.04
+          - host: ubuntu-22.04
             architecture: x86_64
             target: x86_64-unknown-linux-gnu
             toolchain: 1.98.0
             bindgen: false
             gateway: true
 
-          - host: ubuntu-26.04-arm
+          - host: ubuntu-22.04-arm
             architecture: aarch64
             target: aarch64-unknown-linux-gnu
             toolchain: 1.98.0
@@ -258,8 +258,9 @@ jobs:
           name: landscape-frontend-none-all
           path: output/static.zip
 
-  # Debian packages from the native glibc builds. Runs on a runner of the
-  # package's architecture so dpkg-shlibdeps can resolve the binary's libraries.
+  # Debian packages from the native glibc builds. Runs on the same runner
+  # image as linux-build (22.04 keeps the glibc requirement low) and on the
+  # package's architecture so dpkg-shlibdeps can resolve the libraries.
   package-deb:
     needs: [linux-build, build-front]
     runs-on: ${{ matrix.settings.host }}
@@ -267,11 +268,11 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: ubuntu-26.04
+          - host: ubuntu-22.04
             architecture: x86_64
             target: x86_64-unknown-linux-gnu
 
-          - host: ubuntu-26.04-arm
+          - host: ubuntu-22.04-arm
             architecture: aarch64
             target: aarch64-unknown-linux-gnu
 
@@ -282,7 +283,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg-dev binutils unzip libelf1t64 zlib1g
+          sudo apt-get install -y dpkg-dev binutils unzip libelf1 zlib1g
 
       - name: Download binary
         uses: actions/download-artifact@v8
