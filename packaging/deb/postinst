@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+SERVICE=landscape-router.service
+
+if [ "$1" = "configure" ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        # Upgrades restart a running instance onto the new binary. Fresh
+        # installs never start: Landscape reconfigures the host's network.
+        if [ -n "$2" ]; then
+            systemctl try-restart "$SERVICE" || true
+        fi
+    fi
+
+    if [ -z "$2" ]; then
+        echo "Landscape installed. Start it with: systemctl enable --now $SERVICE"
+    fi
+
+    if [ -d /root/.landscape-router ]; then
+        echo "Found /root/.landscape-router: it stays in use until its contents are moved to"
+        echo "/etc/landscape-router and /var/lib/landscape-router (see the startup log)."
+    fi
+fi
+
+exit 0

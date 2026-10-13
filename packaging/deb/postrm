@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+fi
+
+# Config, database, logs and runtime state are created by the daemon, not
+# shipped by the package, so only purge removes them.
+if [ "$1" = "purge" ]; then
+    rm -rf /etc/landscape-router /var/lib/landscape-router /var/log/landscape-router \
+        /run/landscape-router
+fi
+
+exit 0

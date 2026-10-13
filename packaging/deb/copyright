@@ -1,0 +1,16 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: landscape
+Source: https://github.com/ThisSeanZhang/landscape
+
+Files: *
+Copyright: Landscape contributors
+License: GPL-3.0-only
+ On Debian systems, the full text of the GNU General Public License
+ version 3 can be found in /usr/share/common-licenses/GPL-3.
+
+Files: landscape-ebpf/*
+Copyright: Landscape contributors
+License: GPL-2.0-only
+ The eBPF programs embedded in /usr/bin/landscape-webserver are built from
+ landscape-ebpf. On Debian systems, the full text of the GNU General Public
+ License version 2 can be found in /usr/share/common-licenses/GPL-2.
