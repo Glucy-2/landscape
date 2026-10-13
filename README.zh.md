@@ -60,34 +60,54 @@ DNS 平面决策。内核执行。
 - Linux 内核 ≥ 6.9，启用 BTF/BPF，需要 `root` 权限；不支持非 Linux 内核（FreeBSD、macOS）
 - Docker（可选，用于容器导流）
 
-### 1. 创建配置目录
+### 1. 安装
+
+从 [Releases](https://github.com/ThisSeanZhang/landscape/releases) 下载发布资源。
+
+**Debian / Ubuntu（amd64、arm64）**：安装 `landscape-router_<version>_<arch>.deb` 包，其中包含二进制、Web UI 和 systemd unit：
 
 ```bash
-mkdir -p /root/.landscape-router
+sudo apt install ./landscape-router_<version>_<arch>.deb
+sudo systemctl enable --now landscape-router.service
 ```
 
-### 2. 下载发布资源
+首次安装不会自动启动服务，因为 Landscape 会改动主机网络配置。
 
-- 从 [Releases](https://github.com/ThisSeanZhang/landscape/releases)（后端二进制和前端静态资源分开发布）
-  - 下载 `static.zip`
-  - 下载对应架构的 `landscape-webserver` 二进制文件
-- 解压到 `/root/.landscape-router/static`（可额外指定，此为默认路径）
-
-### 3. 启动 Landscape
-
-使用 `root` 运行：
+**其他发行版**：下载 `static.zip` 和对应架构的 `landscape-webserver` 二进制文件，手动安装：
 
 ```bash
-./landscape-webserver
+install -Dm755 landscape-webserver-<arch> /usr/local/bin/landscape-webserver
+mkdir -p /usr/share/landscape-router
+unzip static.zip -d /usr/share/landscape-router   # -> /usr/share/landscape-router/static
 ```
 
-默认参数：配置目录 `/root/.landscape-router`，HTTPS 端口 `6443`，用户/密码 `root` / `root`。首次登录后请立即修改默认密码。
+### 2. 启动 Landscape
+
+手动安装时，使用 `root` 运行：
+
+```bash
+landscape-webserver
+```
+
+默认参数：HTTPS 端口 `6443`，用户/密码 `root` / `root`。首次登录后请立即修改默认密码。Landscape 使用以下目录，不存在时会自动创建：
+
+| 路径 | 内容 |
+|---|---|
+| `/etc/landscape-router` | `landscape.toml`、`landscape_init.toml` |
+| `/var/lib/landscape-router` | 数据库、初始化锁、指标、geo 数据 |
+| `/var/log/landscape-router` | 日志 |
+| `/usr/share/landscape-router/static` | Web UI |
+| `/run/landscape-router` | 容器注册 socket、API token、hostapd 配置 |
+
+`--config_dir <dir>`（或 `LANDSCAPE_CONF_PATH`）会把以上内容全部放到同一个目录下。`--web`、`--log_path`、`--db_url` 可单独覆盖对应路径。
+
+**从旧版本升级：** 如果 `/root/.landscape-router` 存在，Landscape 会继续使用它，并在日志中给出迁移到上述目录的方法。若 `/usr/share/landscape-router/static` 存在，则优先于 `/root/.landscape-router/static` 作为 Web UI。
 
 Landscape 可以在没有预置配置文件的情况下直接启动。如果你想通过 `landscape_init.toml` 进行初始化，请查看文档站中的配置说明。
 
-更多参数可通过 `./landscape-webserver --help` 查看。
+更多参数可通过 `landscape-webserver --help` 查看。
 
-### 4. 打开管理界面
+### 3. 打开管理界面
 
 - `http://landscape.local:6300` 会自动跳转到 HTTPS
 - `https://landscape.local:6443` 打开 Web UI
@@ -95,14 +115,14 @@ Landscape 可以在没有预置配置文件的情况下直接启动。如果你�
 
 ## systemd 服务
 
-确认服务运行正常后，可以把它配置成 `systemd` 服务：
+`.deb` 包会安装 `landscape-router.service`。手动安装时，确认服务运行正常后，将以下内容保存为 `/etc/systemd/system/landscape-router.service`：
 
 ```ini
 [Unit]
 Description=Landscape Router
 
 [Service]
-ExecStart=/root/landscape-webserver
+ExecStart=/usr/local/bin/landscape-webserver
 Restart=always
 User=root
 LimitMEMLOCK=infinity
@@ -111,7 +131,7 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 ```
 
-请把 `ExecStart` 改成你实际的二进制路径。
+然后执行 `systemctl enable --now landscape-router.service`。
 
 ## 开发
 

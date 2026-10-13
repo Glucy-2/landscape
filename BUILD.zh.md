@@ -123,11 +123,23 @@ bash ./build.sh -t x86_64
 
 `build.sh` 会安装前端依赖，只在生成产物或 lock 文件缺失时重新生成 API 类型，构建 Web UI、把 Scalar 静态资源整理到 `output/static`，然后再构建 release 后端二进制。
 
+### Debian 包
+
+执行 `build.sh` 后，可将其产物打包为 `output/landscape-router_<version>_<deb-arch>.deb`：
+
+```bash
+bash ./scripts/package_deb.sh --arch x86_64
+```
+
+脚本默认从 `output/landscape-webserver-<arch>` 取二进制、从 `output/static` 取 Web UI。可用 `--bin` 和 `--static`（目录，或 release 的 `static.zip`）打包其他构建产物，用 `--version` 覆盖 `Cargo.toml` 中的版本。需要 `dpkg-deb`；动态链接的二进制还需要在与包同架构的主机上运行 `dpkg-shlibdeps`（或通过 `--depends` 指定依赖）。包布局、systemd unit 和维护脚本位于 `packaging/`。CI 在 `.github/workflows/build-and-release.yml` 的 `package-deb` job 中构建 amd64 和 arm64 包。
+
 ## `sudo`
 
 依赖安装、格式化、类型生成、普通前端构建和普通 Rust 编译都不需要 `sudo`。
 
 只有在真实主机上运行 `landscape-webserver`、挂载 eBPF、操作真实网卡，或验证真实路由与 packet path 行为时才使用 `sudo`。
+
+不想使用 root 拥有的目录运行开发构建时，可把所有内容放在同一个目录：`landscape-webserver --config_dir ./dev-home`。否则默认使用 `/etc/landscape-router`、`/var/lib/landscape-router`、`/var/log/landscape-router`、`/usr/share/landscape-router/static` 和 `/run/landscape-router`（见 `landscape-common/src/paths.rs`）。
 
 ## 提交前检查
 

@@ -123,11 +123,23 @@ bash ./build.sh -t x86_64
 
 `build.sh` installs frontend dependencies, regenerates API bindings only when the generated files or lock file are missing, builds the web UI, stages the Scalar static assets under `output/static`, and then builds the release backend binary.
 
+### Debian package
+
+After `build.sh`, package its output as `output/landscape-router_<version>_<deb-arch>.deb`:
+
+```bash
+bash ./scripts/package_deb.sh --arch x86_64
+```
+
+The script takes the binary from `output/landscape-webserver-<arch>` and the web UI from `output/static`. Use `--bin` and `--static` (a directory, or the release `static.zip`) to package other builds, and `--version` to override the version in `Cargo.toml`. It needs `dpkg-deb`, plus `dpkg-shlibdeps` on a host of the package's architecture for dynamically linked binaries (or pass `--depends`). The package layout, systemd unit and maintainer scripts live in `packaging/`. CI builds the amd64 and arm64 packages in the `package-deb` job of `.github/workflows/build-and-release.yml`.
+
 ## `sudo`
 
 Do not use `sudo` for dependency installation, formatting, type generation, or normal frontend and Rust builds.
 
 Use `sudo` only when running `landscape-webserver` on a real host, attaching eBPF programs, touching live interfaces, or validating real routing and packet-path behavior.
+
+To run a dev build without root-owned paths, keep everything in one directory: `landscape-webserver --config_dir ./dev-home`. Otherwise it uses `/etc/landscape-router`, `/var/lib/landscape-router`, `/var/log/landscape-router`, `/usr/share/landscape-router/static` and `/run/landscape-router` (see `landscape-common/src/paths.rs`).
 
 ## Before opening a PR
 

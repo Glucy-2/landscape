@@ -60,34 +60,54 @@ DNS plane decides. Kernel enforces.
 - Linux kernel ≥ 6.9 with BTF/BPF enabled, `root` privileges; non-Linux kernels (FreeBSD, macOS) are not supported
 - Docker (optional, for container redirection)
 
-### 1. Create the config directory
+### 1. Install
+
+Download the release assets from [Releases](https://github.com/ThisSeanZhang/landscape/releases).
+
+**Debian / Ubuntu (amd64, arm64)**: install the `landscape-router_<version>_<arch>.deb` package. It includes the binary, the web UI and a systemd unit:
 
 ```bash
-mkdir -p /root/.landscape-router
+sudo apt install ./landscape-router_<version>_<arch>.deb
+sudo systemctl enable --now landscape-router.service
 ```
 
-### 2. Download the release assets
+The package does not start Landscape on first install, because Landscape reconfigures the host network.
 
-- From [Releases](https://github.com/ThisSeanZhang/landscape/releases) (backend binary and frontend static assets are released separately)
-  - Download `static.zip`
-  - Download the `landscape-webserver` binary for your architecture
-- Extract it to `/root/.landscape-router/static` (this is the default path, but it can be customized)
-
-### 3. Start Landscape
-
-Run as `root`:
+**Other distributions**: download `static.zip` and the `landscape-webserver` binary for your architecture, then install both by hand:
 
 ```bash
-./landscape-webserver
+install -Dm755 landscape-webserver-<arch> /usr/local/bin/landscape-webserver
+mkdir -p /usr/share/landscape-router
+unzip static.zip -d /usr/share/landscape-router   # -> /usr/share/landscape-router/static
 ```
 
-Defaults: config at `/root/.landscape-router`, HTTPS on port `6443`, user/pass `root` / `root`.
+### 2. Start Landscape
+
+If you installed by hand, run it as `root`:
+
+```bash
+landscape-webserver
+```
+
+Defaults: HTTPS on port `6443`, user/pass `root` / `root`. Landscape uses these directories, and creates them when missing:
+
+| Path | Contents |
+|---|---|
+| `/etc/landscape-router` | `landscape.toml`, `landscape_init.toml` |
+| `/var/lib/landscape-router` | database, init lock, metrics, geo data |
+| `/var/log/landscape-router` | logs |
+| `/usr/share/landscape-router/static` | web UI |
+| `/run/landscape-router` | container registration socket, API token, hostapd configs |
+
+`--config_dir <dir>` (or `LANDSCAPE_CONF_PATH`) puts all of these under one directory instead. `--web`, `--log_path` and `--db_url` override individual paths.
+
+**Upgrading from an older release:** if `/root/.landscape-router` exists, Landscape keeps using it, and logs a warning that explains how to move to the layout above. A web UI installed in `/usr/share/landscape-router/static` takes precedence over `/root/.landscape-router/static`.
 
 Landscape can start directly without any pre-created configuration file. If you want to initialize it through `landscape_init.toml`, see the configuration guide on the documentation site.
 
-You can check more options with `./landscape-webserver --help`.
+You can check more options with `landscape-webserver --help`.
 
-### 4. Open the management interface
+### 3. Open the management interface
 
 - `http://landscape.local:6300` automatically redirects to HTTPS
 - `https://landscape.local:6443` opens the Web UI
@@ -95,14 +115,14 @@ You can check more options with `./landscape-webserver --help`.
 
 ## Run as a systemd Service
 
-After confirming that the service is running correctly, you can configure it as a `systemd` service:
+The `.deb` package installs `landscape-router.service`. For a manual install, after confirming that Landscape runs correctly, save this as `/etc/systemd/system/landscape-router.service`:
 
 ```ini
 [Unit]
 Description=Landscape Router
 
 [Service]
-ExecStart=/root/landscape-webserver
+ExecStart=/usr/local/bin/landscape-webserver
 Restart=always
 User=root
 LimitMEMLOCK=infinity
@@ -111,7 +131,7 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 ```
 
-Replace `ExecStart` with the actual path to your binary.
+Then run `systemctl enable --now landscape-router.service`.
 
 ## Development
 
