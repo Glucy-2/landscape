@@ -259,7 +259,7 @@ impl LandscapeConfigService {
     }
 
     pub fn get_config_path(&self) -> std::path::PathBuf {
-        self.config.load().home_path.join(landscape_common::LAND_CONFIG)
+        self.config.load().paths.config_file()
     }
 
     pub async fn update_ui_config(

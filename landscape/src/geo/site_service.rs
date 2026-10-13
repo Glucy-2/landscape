@@ -22,7 +22,7 @@ use std::{
 };
 
 use landscape_common::{
-    args::LAND_HOME_PATH,
+    args::LAND_PATHS,
     config_service::geo::{GeoSiteSourceConfig, normalize_adguard_key},
     event::dns::DnsEvent,
 };
@@ -127,7 +127,9 @@ impl GeoSiteService {
         let store = store.geo_site_rule_store();
 
         let cache = SiteCacheRepository::new(
-            GeoCacheDatabase::open_site(&LAND_HOME_PATH).await.expect("open geo site cache db"),
+            GeoCacheDatabase::open_site(&LAND_PATHS.data_dir)
+                .await
+                .expect("open geo site cache db"),
         );
         // compiled matchers live next to the data they are derived from; the
         // registry shares the cache's pool and is refreshed below before any

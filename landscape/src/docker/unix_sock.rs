@@ -7,8 +7,8 @@ use std::{
 use tokio::net::UnixListener;
 use tracing::{error, info};
 
-pub(crate) async fn listen_unix_sock(home_path: PathBuf) -> io::Result<UnixListener> {
-    let dir_path = home_path.join(NAMESPACE_REGISTER_SOCK_PATH);
+pub(crate) async fn listen_unix_sock(run_dir: PathBuf) -> io::Result<UnixListener> {
+    let dir_path = run_dir.join(NAMESPACE_REGISTER_SOCK_PATH);
 
     // Check Directory Status
     if !dir_path.exists() {

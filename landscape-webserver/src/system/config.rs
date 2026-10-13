@@ -1,8 +1,8 @@
 use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
+use landscape_common::INIT_FILE_NAME;
 use landscape_common::api_response::LandscapeApiResp as CommonApiResp;
 use landscape_common::config::{InitConfig, InitConfigError};
 use landscape_common::database::error::DbError;
-use landscape_common::{INIT_FILE_NAME, INIT_LOCK_FILE_NAME};
 use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Write};
 use tempfile::NamedTempFile;
@@ -161,18 +161,19 @@ async fn import_init_config(
     } else {
         let init_config_content = toml::to_string(&init_config)
             .map_err(|e| InitConfigError::Invalid { reason: e.to_string() })?;
-        let config_path = state.home_path.join(INIT_FILE_NAME);
+        let config_path = state.paths.init_file();
         let previous_init_config = match std::fs::read(&config_path) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(DbError::from(e))?,
         };
-        let mut temp_file = NamedTempFile::new_in(&state.home_path).map_err(DbError::from)?;
+        let mut temp_file =
+            NamedTempFile::new_in(&state.paths.config_dir).map_err(DbError::from)?;
         temp_file.write_all(init_config_content.as_bytes()).map_err(DbError::from)?;
         temp_file.as_file().sync_all().map_err(DbError::from)?;
         temp_file.persist(&config_path).map_err(|e| DbError::from(e.error))?;
 
-        let lock_path = state.home_path.join(INIT_LOCK_FILE_NAME);
+        let lock_path = state.paths.init_lock_file();
         match std::fs::remove_file(lock_path) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}

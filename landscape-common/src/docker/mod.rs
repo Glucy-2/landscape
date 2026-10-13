@@ -46,7 +46,7 @@ pub struct DockerCmd {
 
 impl DockerCmd {
     // 生成 Docker 命令
-    pub fn generate_docker_command(&self, home_path: &Path) -> Vec<String> {
+    pub fn generate_docker_command(&self, run_dir: &Path) -> Vec<String> {
         let mut command = vec!["docker".to_string(), "run".to_string(), "-d".to_string()];
 
         if let Some(container_name) = &self.container_name {
@@ -106,10 +106,10 @@ impl DockerCmd {
             command.push("--cap-add=BPF".to_string());
             command.push("--cap-add=PERFMON".to_string());
             command.push("--volume".to_string());
-            // /root/.landscape-router/unix_link/:/ld_unix_link/
+            // /run/landscape-router/unix_link/:/ld_unix_link/
             let mapping_volume = format!(
                 "{}/:/{}/:ro",
-                home_path.join(NAMESPACE_REGISTER_SOCK_PATH).display(),
+                run_dir.join(NAMESPACE_REGISTER_SOCK_PATH).display(),
                 NAMESPACE_REGISTER_SOCK_PATH_IN_DOCKER
             );
             command.push(mapping_volume);
@@ -127,8 +127,8 @@ impl DockerCmd {
 
     // 执行 Docker 命令
     #[allow(clippy::result_unit_err)] // 内部 API：调用方只关心成功与否
-    pub async fn execute_docker_command(&self, home_path: &Path) -> Result<(), ()> {
-        let command = self.generate_docker_command(home_path);
+    pub async fn execute_docker_command(&self, run_dir: &Path) -> Result<(), ()> {
+        let command = self.generate_docker_command(run_dir);
         if let Ok(status) =
             tokio::process::Command::new(&command[0]).args(&command[1..]).status().await
         {

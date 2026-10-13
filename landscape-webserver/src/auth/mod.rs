@@ -15,7 +15,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::{extract::Request, middleware::Next, response::Response};
 use landscape_common::LANDSCAPE_SYS_TOKEN_FILE_ANME;
 use landscape_common::api_response::LandscapeApiResp as CommonApiResp;
-use landscape_common::args::LAND_HOME_PATH;
+use landscape_common::args::LAND_PATHS;
 use landscape_common::auth::LoginInfo;
 use landscape_common::auth::LoginResult;
 use landscape_common::config::AuthRuntimeConfig;
@@ -123,7 +123,7 @@ pub static SECRET_KEY: Lazy<String> = Lazy::new(|| {
 });
 
 pub async fn output_sys_token(auth: &AuthRuntimeConfig) {
-    let token_path = LAND_HOME_PATH.join(LANDSCAPE_SYS_TOKEN_FILE_ANME);
+    let token_path = LAND_PATHS.run_dir.join(LANDSCAPE_SYS_TOKEN_FILE_ANME);
     // 生成长期有效的系统 token
     let sys_token =
         create_jwt(&auth.admin_user, SYS_TOKEN_EXPIRE_TIME).expect("Failed to create system token");

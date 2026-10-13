@@ -6,10 +6,10 @@ use std::{
 
 use uuid::Uuid;
 
-use landscape_common::{LANDSCAPE_GEO_RAW_DIR, args::LAND_HOME_PATH};
+use landscape_common::{LANDSCAPE_GEO_RAW_DIR, args::LAND_PATHS};
 
 pub fn raw_dat_path(kind: &str, id: Uuid) -> PathBuf {
-    LAND_HOME_PATH.join(LANDSCAPE_GEO_RAW_DIR).join(format!("{kind}-{id}.raw"))
+    LAND_PATHS.data_dir.join(LANDSCAPE_GEO_RAW_DIR).join(format!("{kind}-{id}.raw"))
 }
 
 fn tmp_path_of(final_path: &Path) -> PathBuf {
@@ -155,7 +155,7 @@ pub fn sweep_orphan_raw_files(
     kind: &str,
     live_ids: &std::collections::HashSet<Uuid>,
 ) -> Vec<PathBuf> {
-    sweep_orphan_raw_files_in(&LAND_HOME_PATH.join(LANDSCAPE_GEO_RAW_DIR), kind, live_ids)
+    sweep_orphan_raw_files_in(&LAND_PATHS.data_dir.join(LANDSCAPE_GEO_RAW_DIR), kind, live_ids)
 }
 
 fn sweep_orphan_raw_files_in(

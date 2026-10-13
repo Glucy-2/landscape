@@ -1,16 +1,15 @@
-use std::{net::IpAddr, path::PathBuf};
+use std::{net::IpAddr, path::PathBuf, sync::LazyLock};
 
 use clap::{Parser, Subcommand};
-use once_cell::sync::Lazy;
 
-use crate::LANDSCAPE_CONFIG_DIR_NAME;
+use crate::paths::LandscapePaths;
 
-pub static LAND_HOSTNAME: Lazy<String> = Lazy::new(|| {
+pub static LAND_HOSTNAME: LazyLock<String> = LazyLock::new(|| {
     let hostname = hostname::get().expect("无法获取主机名");
     hostname.to_string_lossy().to_string()
 });
 
-pub static LAND_ARGS: Lazy<WebCommArgs> = Lazy::new(|| {
+pub static LAND_ARGS: LazyLock<WebCommArgs> = LazyLock::new(|| {
     dotenvy::dotenv().ok();
     if std::env::var_os("LANDSCAPE_IGNORE_CLI_ARGS").is_some() || running_under_test_harness() {
         // Test/embedded use: ignore the real argv (test harness filters etc.)
@@ -42,21 +41,13 @@ fn looks_like_test_binary(exe: &std::path::Path) -> bool {
     }
 }
 
-pub static LAND_HOME_PATH: Lazy<PathBuf> = Lazy::new(|| {
-    if let Some(path) = &LAND_ARGS.config_dir {
-        path.clone()
-    } else {
-        let Some(path) = homedir::my_home().unwrap() else {
-            panic!("can not get home path");
-        };
-        path.join(LANDSCAPE_CONFIG_DIR_NAME)
-    }
-});
+pub static LAND_PATHS: LazyLock<LandscapePaths> =
+    LazyLock::new(|| LandscapePaths::resolve(LAND_ARGS.config_dir.as_deref()));
 
 #[derive(Parser, Debug, Clone, Default)]
 #[command(version, about, long_about = None)]
 pub struct WebCommArgs {
-    /// Static HTML location [default: /root/.landscape-router/static]
+    /// Static HTML location [default: /usr/share/landscape-router/static]
     #[arg(short, long, env = "LANDSCAPE_WEB_ROOT")]
     pub web: Option<PathBuf>,
 
@@ -76,17 +67,21 @@ pub struct WebCommArgs {
     #[arg(short, long)]
     pub export_manager: bool,
 
-    /// All Config DIR, Not file Path [default: /root/.landscape-router]
+    /// Put config, data, logs, web root and sockets all under this directory
+    /// instead of /etc/landscape-router, /var/lib/landscape-router,
+    /// /var/log/landscape-router, /usr/share/landscape-router/static and
+    /// /run/landscape-router.
+    /// An existing ~/.landscape-router is used the same way when unset.
     #[clap(short, long, env = "LANDSCAPE_CONF_PATH")]
     pub config_dir: Option<PathBuf>,
 
-    /// Log File location [default: /root/.landscape-router/logs]
+    /// Log File location [default: /var/log/landscape-router]
     #[clap(long = "log_path", env = "LANDSCAPE_LOG_PATH")]
     pub log_path: Option<PathBuf>,
 
     /// Database URL, SQLite Connect Like Default
     /// sqlite://<path>
-    /// [default: sqlite:///root/.landscape-router/landscape_db.sqlite]
+    /// [default: sqlite:///var/lib/landscape-router/landscape_db.sqlite]
     #[clap(long = "db_url", env = "DATABASE_URL")]
     pub database_path: Option<String>,
 

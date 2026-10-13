@@ -141,7 +141,7 @@ async fn run_cmd_container(
     State(state): State<LandscapeApp>,
     JsonBody(docker_cmd): JsonBody<DockerCmd>,
 ) -> LandscapeApiResult<()> {
-    if docker_cmd.execute_docker_command(&state.home_path).await.is_err() {
+    if docker_cmd.execute_docker_command(&state.paths.run_dir).await.is_err() {
         Err(DockerError::FailToRunContainerByCmd)?;
     }
     LandscapeApiResp::success(())

@@ -8,17 +8,17 @@ use crate::config::settings::{
     LandscapeUIConfig, MetricMode,
 };
 use crate::config::{cleanup_budget_secs_to_ms, metric_db_max_mb_to_bytes};
+use crate::paths::LandscapePaths;
 use crate::sys_service::gateway::settings::GatewayRuntimeConfig;
 use crate::sys_service::lan_hostname::LanHostnameConfig;
 use crate::{
     DEFAULT_TIME_ENABLE, DEFAULT_TIME_SAMPLES_PER_SERVER, DEFAULT_TIME_SERVERS,
     DEFAULT_TIME_STEP_THRESHOLD_MS, DEFAULT_TIME_SYNC_INTERVAL_SECS, DEFAULT_TIME_TIMEOUT_SECS,
-    LANDSCAPE_DB_SQLITE_NAME,
 };
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    pub home_path: PathBuf,
+    pub paths: LandscapePaths,
     pub file_config: LandscapeConfig,
     pub auth: AuthRuntimeConfig,
     pub log: LogRuntimeConfig,
@@ -125,7 +125,10 @@ impl RuntimeConfig {
         };
         format!(
             "\n\
-         Landscape Home Path: {}\n\
+         Path Layout: {:?}\n\
+         Config Dir: {}\n\
+         Data Dir: {}\n\
+         Run Dir: {}\n\
          \n\
          [Auth]\n\
          Admin User: {}\n\
@@ -170,7 +173,10 @@ impl RuntimeConfig {
           Timeout: {}s\n\
           Step Threshold: {}ms\n\
           Samples Per Server: {}\n",
-            self.home_path.display(),
+            self.paths.layout,
+            self.paths.config_dir.display(),
+            self.paths.data_dir.display(),
+            self.paths.run_dir.display(),
             self.auth.admin_user,
             self.log.log_path.display(),
             self.log.debug,
@@ -303,8 +309,7 @@ impl TimeRuntimeConfig {
 }
 
 impl StoreRuntimeConfig {
-    pub fn create_default_db_store(home_path: &Path) -> String {
-        let path = home_path.join(LANDSCAPE_DB_SQLITE_NAME);
+    pub fn create_default_db_store(path: &Path) -> String {
         if path.exists() {
             if path.is_dir() {
                 tracing::error!(
@@ -323,7 +328,7 @@ impl StoreRuntimeConfig {
                     "failed to create database directory"
                 );
             }
-            if let Err(error) = std::fs::File::create(&path) {
+            if let Err(error) = std::fs::File::create(path) {
                 tracing::error!(path = %path.display(), %error, "failed to create database file");
             }
         }

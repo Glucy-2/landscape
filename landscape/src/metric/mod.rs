@@ -41,7 +41,7 @@ struct MetricRuntime {
 }
 
 struct MetricServiceInner {
-    home_path: PathBuf,
+    data_dir: PathBuf,
     runtime: RwLock<MetricRuntime>,
     switch_lock: Mutex<()>,
     source_factory: Arc<dyn MetricSourceFactory>,
@@ -57,8 +57,8 @@ pub struct MetricService {
     inner: Arc<MetricServiceInner>,
 }
 
-fn ensure_metric_path(home_path: &Path) -> PathBuf {
-    let metric_path = home_path.join(LANDSCAPE_METRIC_DIR_NAME);
+fn ensure_metric_path(data_dir: &Path) -> PathBuf {
+    let metric_path = data_dir.join(LANDSCAPE_METRIC_DIR_NAME);
     if !metric_path.exists()
         && let Err(e) = std::fs::create_dir_all(&metric_path)
     {
@@ -83,11 +83,11 @@ impl MetricService {
     }
 
     pub async fn new(
-        home_path: PathBuf,
+        data_dir: PathBuf,
         config: MetricRuntimeConfig,
         source_factory: Arc<dyn MetricSourceFactory>,
     ) -> Result<Self, String> {
-        let metric_path = ensure_metric_path(&home_path);
+        let metric_path = ensure_metric_path(&data_dir);
         let engine = MetricEngine::new(metric_path, config.clone())
             .await
             .map_err(|error| format!("failed to initialize metric engine: {error}"))?;
@@ -96,7 +96,7 @@ impl MetricService {
         Ok(MetricService {
             status,
             inner: Arc::new(MetricServiceInner {
-                home_path,
+                data_dir,
                 runtime: RwLock::new(MetricRuntime { config, engine, source: None }),
                 switch_lock: Mutex::new(()),
                 source_factory,
@@ -178,9 +178,9 @@ impl MetricService {
             // 已打开:恢复被 stop_service 停掉的 recorder。
             Some(recording) => recording.spawn_recorder(DEFAULT_MEM_METRIC_RETENTION_DAYS),
             None => {
-                let home_path = self.inner.home_path.clone();
+                let data_dir = self.inner.data_dir.clone();
                 *mem = landscape_metric::self_monitor_store::start_memory_recording(
-                    home_path,
+                    data_dir,
                     DEFAULT_MEM_METRIC_RETENTION_DAYS,
                 )
                 .await;
@@ -236,7 +236,7 @@ impl MetricService {
         self.stop_service_locked().await;
 
         let new_engine = match MetricEngine::new(
-            ensure_metric_path(&self.inner.home_path),
+            ensure_metric_path(&self.inner.data_dir),
             config.clone(),
         )
         .await
@@ -279,7 +279,7 @@ impl MetricService {
             let runtime = self.read_runtime();
             runtime.config.clone()
         };
-        match MetricEngine::new(ensure_metric_path(&self.inner.home_path), previous_config.clone())
+        match MetricEngine::new(ensure_metric_path(&self.inner.data_dir), previous_config.clone())
             .await
         {
             Ok(engine) => {
@@ -293,7 +293,7 @@ impl MetricService {
                 let mut fallback_config = previous_config;
                 fallback_config.mode = MetricMode::Memory;
                 let fallback_engine = MetricEngine::new(
-                    ensure_metric_path(&self.inner.home_path),
+                    ensure_metric_path(&self.inner.data_dir),
                     fallback_config.clone(),
                 )
                 .await

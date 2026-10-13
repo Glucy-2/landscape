@@ -60,7 +60,7 @@ pub struct ConfigCliArgs {
     #[arg(long)]
     pub stdout: bool,
 
-    /// Write landscape_init.toml into this directory (default: home config dir)
+    /// Write landscape_init.toml into this directory (default: /etc/landscape-router)
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
 

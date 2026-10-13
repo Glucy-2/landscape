@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -51,12 +51,13 @@ use landscape::{
 use landscape_common::lan_service::lan_route::RouteLanServiceConfig;
 use landscape_common::{
     VERSION,
-    args::{DbAction, LAND_ARGS, LAND_HOME_PATH, LandscapeAction},
+    args::{DbAction, LAND_ARGS, LAND_PATHS, LandscapeAction},
     concurrency::{runtime_thread_name_fn, spawn_task, task_label, thread_name},
     config::RuntimeConfig,
     database::error::DbError,
     database::store::ConfigStore,
     event::hub::EventHub,
+    paths::PathLayout,
 };
 use landscape_common::{config::InitConfig, lan_service::lan_dhcpv4::config::DHCPv4ServiceConfig};
 use landscape_core::cert::build_tls_server_config_with_shared_resolver;
@@ -129,10 +130,11 @@ pub enum StartupError {
     Metric(String),
     #[error("config: {0}")]
     Config(String),
+    #[error(transparent)]
+    CreateDirs(#[from] landscape_common::paths::CreateDirError),
 }
 
 async fn prepare_startup_init(
-    home_path: &Path,
     config: &RuntimeConfig,
     init_config_to_import: Option<InitConfig>,
 ) -> Result<LandscapeDBServiceProvider, StartupError> {
@@ -166,22 +168,21 @@ async fn prepare_startup_init(
                 .await?;
             db_store_provider
                 .truncate_and_fit_from_before_commit(init_config, || {
-                    if let Some(config) = init_file_config_to_persist {
-                        write_config_toml(home_path, config)
+                    if let Some(file_config) = init_file_config_to_persist {
+                        write_config_toml(&config.paths, file_config)
                             .map_err(|e| DbError::Internal(e.to_string()))?;
                     }
                     Ok(())
                 })
                 .await?
         });
-        startup_phase!("write_init_lock", write_init_lock(home_path)?);
+        startup_phase!("write_init_lock", write_init_lock(&config.paths)?);
     }
 
     Ok(db_store_provider)
 }
 
 async fn run_system(
-    home_path: PathBuf,
     config: RuntimeConfig,
     db_store_provider: LandscapeDBServiceProvider,
     time_service: SyncTimeService,
@@ -268,7 +269,7 @@ async fn run_system(
     let metric_service = startup_phase!(
         "metric_service.new",
         MetricService::new(
-            home_path.clone(),
+            config.paths.data_dir.clone(),
             config.metric.clone(),
             Arc::new(ebpf_rt.metric_source_factory()),
         )
@@ -490,7 +491,8 @@ async fn run_system(
     )
     .await;
 
-    let docker_service = LandscapeDockerService::new(home_path.clone(), route_service.clone());
+    let docker_service =
+        LandscapeDockerService::new(config.paths.run_dir.clone(), route_service.clone());
 
     startup_phase!(
         "docker_service.start_to_listen_event",
@@ -502,7 +504,7 @@ async fn run_system(
     let memory_history = landscape_common::memtrack::start_sampler();
     let auth_share = Arc::new(ArcSwap::from_pointee(config.auth.clone()));
     let landscape_app_status = LandscapeApp {
-        home_path: home_path.clone(),
+        paths: Arc::new(config.paths.clone()),
         auth: auth_share.clone(),
         ebpf_paths,
         time_service,
@@ -710,11 +712,11 @@ fn main() -> Result<(), StartupError> {
 }
 
 async fn async_main() -> Result<(), StartupError> {
-    let home_path = LAND_HOME_PATH.clone();
+    let paths = &*LAND_PATHS;
 
-    let lock_exists = home_path.join(landscape_common::INIT_LOCK_FILE_NAME).exists();
-    let init_exists = home_path.join(landscape_common::INIT_FILE_NAME).exists();
-    let db_exists = home_path.join(landscape_common::LANDSCAPE_DB_SQLITE_NAME).exists();
+    let lock_exists = paths.init_lock_file().exists();
+    let init_exists = paths.init_file().exists();
+    let db_exists = paths.db_file().exists();
 
     let args = (*LAND_ARGS).clone();
 
@@ -727,7 +729,9 @@ async fn async_main() -> Result<(), StartupError> {
         return Ok(());
     }
 
-    let init_config_to_import = if args.action.is_none() { boot_check(&home_path)? } else { None };
+    paths.create_dirs()?;
+
+    let init_config_to_import = if args.action.is_none() { boot_check(paths)? } else { None };
     let config = RuntimeConfig::new_with_file_config(
         args.clone(),
         init_config_to_import
@@ -738,6 +742,16 @@ async fn async_main() -> Result<(), StartupError> {
 
     if let Err(e) = init_logger(config.log.clone()) {
         panic!("init log error: {e:?}");
+    }
+
+    if paths.layout == PathLayout::LegacyHome {
+        tracing::warn!(
+            "Using legacy layout under {dir}. To switch to the standard layout, stop Landscape, \
+             move landscape.toml and landscape_init.toml to /etc/landscape-router, move \
+             landscape_db.sqlite, landscape_init.lock, metric/ and geo/ to \
+             /var/lib/landscape-router, then remove {dir}.",
+            dir = paths.config_dir.display()
+        );
     }
 
     let time_service = SyncTimeService::start(config.time.clone());
@@ -761,7 +775,7 @@ async fn async_main() -> Result<(), StartupError> {
             }
             tracing::info!("Auto init skipped: {}.", reasons.join(", "));
         } else {
-            do_auto_init(&home_path, &config).await?;
+            do_auto_init(&config).await?;
             init_config_to_import = None;
         }
     }
@@ -799,13 +813,12 @@ async fn async_main() -> Result<(), StartupError> {
             LandscapeAction::Config(_) => Ok(()),
         }
     } else {
-        let db_store_provider =
-            prepare_startup_init(&home_path, &config, init_config_to_import).await?;
-        run_system(home_path, config, db_store_provider, time_service).await
+        let db_store_provider = prepare_startup_init(&config, init_config_to_import).await?;
+        run_system(config, db_store_provider, time_service).await
     }
 }
 
-async fn do_auto_init(home_path: &PathBuf, config: &RuntimeConfig) -> Result<(), StartupError> {
+async fn do_auto_init(config: &RuntimeConfig) -> Result<(), StartupError> {
     let mut interface_map = HashMap::new();
     let devs = landscape::get_all_devices().await;
     tracing::info!("Discovered {} total interfaces.", devs.len());
@@ -826,7 +839,7 @@ async fn do_auto_init(home_path: &PathBuf, config: &RuntimeConfig) -> Result<(),
     }
 
     // 创建 lock 文件 避免重复进行初始化
-    write_init_lock(home_path)?;
+    write_init_lock(&config.paths)?;
 
     // 初始化 br_lan 的服务
     let dhcp_store = db_store_provider.dhcp_v4_server_store();

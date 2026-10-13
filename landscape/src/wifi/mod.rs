@@ -2,7 +2,7 @@ use landscape_common::database::error::DbError;
 use landscape_common::database::store::ConfigStore;
 use landscape_common::{
     LANDSCAPE_HOSTAPD_TMP_DIR,
-    args::LAND_HOME_PATH,
+    args::LAND_PATHS,
     concurrency::{short_thread_name, spawn_named_thread, task_label, thread_name},
     lan_service::ap::WifiServiceConfig,
     service::{
@@ -149,7 +149,7 @@ pub async fn create_wifi_service(
 }
 
 fn write_config(iface_name: &str, config: &str) -> Result<String, ()> {
-    let file_dir = LAND_HOME_PATH.join(LANDSCAPE_HOSTAPD_TMP_DIR);
+    let file_dir = LAND_PATHS.run_dir.join(LANDSCAPE_HOSTAPD_TMP_DIR);
     if !file_dir.exists() {
         std::fs::create_dir_all(&file_dir).unwrap();
     } else {
@@ -185,7 +185,7 @@ fn write_config(iface_name: &str, config: &str) -> Result<String, ()> {
 }
 fn delete_config(iface_name: &str) {
     let _ = std::fs::remove_file(
-        LAND_HOME_PATH.join(LANDSCAPE_HOSTAPD_TMP_DIR).join(format!("{}.conf", iface_name)),
+        LAND_PATHS.run_dir.join(LANDSCAPE_HOSTAPD_TMP_DIR).join(format!("{}.conf", iface_name)),
     );
 }
 

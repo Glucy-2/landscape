@@ -1,7 +1,5 @@
-use std::{
-    net::{IpAddr, Ipv6Addr},
-    path::PathBuf,
-};
+use std::net::{IpAddr, Ipv6Addr};
+use std::path::Path;
 
 use crate::args::WebCommArgs;
 use crate::config::runtime::{
@@ -10,25 +8,13 @@ use crate::config::runtime::{
 };
 use crate::config::settings::LandscapeConfig;
 use crate::config::{cleanup_budget_secs_to_ms, metric_db_max_mb_to_bytes};
+use crate::paths::LandscapePaths;
 use crate::sys_service::gateway::settings::GatewayRuntimeConfig;
 use crate::sys_service::lan_hostname::LanHostnameConfig;
 use crate::{
     DEFAULT_TIME_ENABLE, DEFAULT_TIME_SAMPLES_PER_SERVER, DEFAULT_TIME_SERVERS,
     DEFAULT_TIME_STEP_THRESHOLD_MS, DEFAULT_TIME_SYNC_INTERVAL_SECS, DEFAULT_TIME_TIMEOUT_SECS,
-    LAND_CONFIG, LANDSCAPE_CONFIG_DIR_NAME, LANDSCAPE_LOG_DIR_NAME, LANDSCAPE_WEBROOT_DIR_NAME,
 };
-
-fn default_home_path() -> PathBuf {
-    match homedir::my_home() {
-        Ok(Some(path)) => path.join(LANDSCAPE_CONFIG_DIR_NAME),
-        Ok(None) | Err(_) => {
-            tracing::warn!(
-                "unable to determine the user home directory; using a local config path"
-            );
-            PathBuf::from(LANDSCAPE_CONFIG_DIR_NAME)
-        }
-    }
-}
 
 const fn default_debug_mode() -> bool {
     #[cfg(debug_assertions)]
@@ -41,10 +27,9 @@ const fn default_debug_mode() -> bool {
     }
 }
 
-fn read_home_config_file(home_path: PathBuf) -> LandscapeConfig {
-    let config_path = home_path.join(LAND_CONFIG);
+fn read_config_file(config_path: &Path) -> LandscapeConfig {
     if config_path.exists() && config_path.is_file() {
-        let config_raw = match std::fs::read_to_string(&config_path) {
+        let config_raw = match std::fs::read_to_string(config_path) {
             Ok(config_raw) => config_raw,
             Err(error) => {
                 tracing::error!(
@@ -81,27 +66,17 @@ impl RuntimeConfig {
             a.clone().or_else(|| b.clone()).unwrap_or(default)
         }
 
-        let mut home_path = args.config_dir.unwrap_or(default_home_path());
+        let paths = LandscapePaths::resolve(args.config_dir.as_deref());
 
-        if home_path.is_relative() {
-            let current_dir = std::env::current_dir().unwrap_or_else(|error| {
-                tracing::warn!(%error, "failed to determine current directory; using relative config path");
-                PathBuf::from(".")
-            });
-            home_path = current_dir.join(home_path);
-            home_path = home_path.components().collect();
-        }
-
-        let mut config = file_config.unwrap_or_else(|| read_home_config_file(home_path.clone()));
+        let mut config = file_config.unwrap_or_else(|| read_config_file(&paths.config_file()));
 
         let auth = AuthRuntimeConfig {
             admin_user: read_value(&args.admin_user, &config.auth.admin_user, "root".to_string()),
             admin_pass: read_value(&args.admin_pass, &config.auth.admin_pass, "root".to_string()),
         };
 
-        let default_log_path = home_path.join(LANDSCAPE_LOG_DIR_NAME);
         let log = LogRuntimeConfig {
-            log_path: read_value(&args.log_path, &config.log.log_path, default_log_path),
+            log_path: read_value(&args.log_path, &config.log.log_path, paths.log_dir.clone()),
             debug: read_value(&args.debug, &config.log.debug, default_debug_mode()),
             log_output_in_terminal: read_value(
                 &args.log_output_in_terminal,
@@ -112,9 +87,8 @@ impl RuntimeConfig {
             log_filter: args.log_filter.clone(),
         };
 
-        let default_web_path = home_path.join(LANDSCAPE_WEBROOT_DIR_NAME);
         let web = WebRuntimeConfig {
-            web_root: read_value(&args.web, &config.web.web_root, default_web_path),
+            web_root: read_value(&args.web, &config.web.web_root, paths.web_root.clone()),
             port: read_value(&args.port, &config.web.port, 6300),
             https_port: read_value(&args.https_port, &config.web.https_port, 6443),
             address: read_value(
@@ -129,7 +103,7 @@ impl RuntimeConfig {
                 .database_path
                 .clone()
                 .or_else(|| config.store.database_path.clone())
-                .unwrap_or_else(|| StoreRuntimeConfig::create_default_db_store(&home_path)),
+                .unwrap_or_else(|| StoreRuntimeConfig::create_default_db_store(&paths.db_file())),
         };
 
         let connect_1d_retention_days = config
@@ -266,7 +240,7 @@ impl RuntimeConfig {
         let gateway = GatewayRuntimeConfig::from_file_config(&config.gateway);
 
         RuntimeConfig {
-            home_path,
+            paths,
             auth,
             log,
             web,

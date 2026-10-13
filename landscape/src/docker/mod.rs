@@ -34,13 +34,14 @@ pub struct LandscapeDockerService {
     /// 与运行实例同生命周期,跨周期不复用),stop 后取出丢弃。
     run: Arc<Mutex<Option<DockerRun>>>,
     route_service: IpRouteService,
-    home_path: PathBuf,
+    /// Holds `unix_link/`, bind-mounted into flow-edge containers.
+    run_dir: PathBuf,
     pub pull_manager: PullManager,
     docker_client: Arc<RwLock<Option<Docker>>>,
 }
 
 impl LandscapeDockerService {
-    pub fn new(home_path: PathBuf, route_service: IpRouteService) -> Self {
+    pub fn new(run_dir: PathBuf, route_service: IpRouteService) -> Self {
         let docker_client = Arc::new(RwLock::new(
             Docker::connect_with_unix_defaults()
                 .map_err(|e| tracing::warn!("Docker Connect Fail on init: {e:?}"))
@@ -50,7 +51,7 @@ impl LandscapeDockerService {
         LandscapeDockerService {
             run: Arc::new(Mutex::new(None)),
             route_service,
-            home_path,
+            run_dir,
             pull_manager,
             docker_client,
         }
@@ -90,7 +91,7 @@ impl LandscapeDockerService {
         current.just_change_status(ServiceStatus::Staring);
 
         let route_service = self.route_service.clone();
-        let path = self.home_path.clone();
+        let path = self.run_dir.clone();
         let docker_client = self.docker_client.clone();
         let scan_route_service = route_service.clone();
         let scan_docker_client = docker_client.clone();

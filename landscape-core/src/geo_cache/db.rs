@@ -60,20 +60,20 @@ const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub struct GeoCacheDatabase;
 
 impl GeoCacheDatabase {
-    /// `{land_home}/geo/cache/site.sqlite`
-    pub async fn open_site(land_home: &Path) -> Result<sqlx::SqlitePool, DbError> {
+    /// `{data_dir}/geo/cache/site.sqlite`
+    pub async fn open_site(data_dir: &Path) -> Result<sqlx::SqlitePool, DbError> {
         Self::open(
-            &land_home.join(LANDSCAPE_GEO_CACHE_DIR).join("site.sqlite"),
+            &data_dir.join(LANDSCAPE_GEO_CACHE_DIR).join("site.sqlite"),
             SITE_CACHE_SCHEMA_VERSION,
             &[ENTRIES_DDL, SITE_DDL],
         )
         .await
     }
 
-    /// `{land_home}/geo/cache/ip.sqlite`
-    pub async fn open_ip(land_home: &Path) -> Result<sqlx::SqlitePool, DbError> {
+    /// `{data_dir}/geo/cache/ip.sqlite`
+    pub async fn open_ip(data_dir: &Path) -> Result<sqlx::SqlitePool, DbError> {
         Self::open(
-            &land_home.join(LANDSCAPE_GEO_CACHE_DIR).join("ip.sqlite"),
+            &data_dir.join(LANDSCAPE_GEO_CACHE_DIR).join("ip.sqlite"),
             IP_CACHE_SCHEMA_VERSION,
             &[ENTRIES_DDL, IP_DDL],
         )

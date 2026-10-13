@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use landscape_common::{args::LAND_HOME_PATH, event::dns::DstIpEvent};
+use landscape_common::{args::LAND_PATHS, event::dns::DstIpEvent};
 use landscape_core::geo_cache::{GeoCacheDatabase, IpCacheRepository, IpCidrRow};
 use landscape_database::{
     geo_ip::repository::GeoIpSourceConfigRepository, provider::LandscapeDBServiceProvider,
@@ -101,7 +101,7 @@ impl GeoIpService {
         let store = store.geo_ip_rule_store();
 
         let cache = IpCacheRepository::new(
-            GeoCacheDatabase::open_ip(&LAND_HOME_PATH).await.expect("open geo ip cache db"),
+            GeoCacheDatabase::open_ip(&LAND_PATHS.data_dir).await.expect("open geo ip cache db"),
         );
 
         let service = Self {

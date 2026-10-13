@@ -1,7 +1,8 @@
-use std::{net::IpAddr, panic::AssertUnwindSafe, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::IpAddr, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use futures::FutureExt;
+use landscape_common::paths::LandscapePaths;
 use landscape_core::lan_device::LanDeviceDirectory;
 use landscape_ebpf::maps::LandscapeMapPath;
 
@@ -47,7 +48,7 @@ use crate::gateway_runtime::GatewayService;
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct LandscapeApp {
-    pub home_path: PathBuf,
+    pub paths: Arc<LandscapePaths>,
     pub auth: Arc<ArcSwap<AuthRuntimeConfig>>,
     /// eBPF map pin paths (for ad-hoc map introspection endpoints).
     pub(crate) ebpf_paths: Arc<LandscapeMapPath>,

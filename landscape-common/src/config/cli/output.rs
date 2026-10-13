@@ -19,8 +19,10 @@ impl ConfigCliArgs {
         if self.stdout {
             return ConfigOutput::Stdout;
         }
-        let dir = self.dir.clone().unwrap_or_else(|| crate::args::LAND_HOME_PATH.clone());
-        ConfigOutput::File(dir.join(INIT_FILE_NAME))
+        match &self.dir {
+            Some(dir) => ConfigOutput::File(dir.join(INIT_FILE_NAME)),
+            None => ConfigOutput::File(crate::args::LAND_PATHS.init_file()),
+        }
     }
 }
 

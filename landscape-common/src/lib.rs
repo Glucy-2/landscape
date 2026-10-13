@@ -22,6 +22,7 @@ pub mod flow;
 pub mod memtrack;
 pub mod metric;
 pub mod network;
+pub mod paths;
 
 pub mod self_monitor;
 
@@ -43,9 +44,6 @@ pub mod wan_link;
 pub mod wan_service;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Home Path
-pub const LANDSCAPE_CONFIG_DIR_NAME: &str = ".landscape-router";
 
 /// sys token
 pub const LANDSCAPE_SYS_TOKEN_FILE_ANME: &str = "landscape_api_token";
