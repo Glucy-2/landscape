@@ -20,7 +20,10 @@ import {
   type RuntimeT,
 } from "@/lib/wan_runtime";
 import { IfaceZoneType } from "@landscape-router/types/api/schemas";
-import type { WanLinkSectionsSnapshot } from "@landscape-router/types/api/schemas";
+import type {
+  PdLease,
+  WanLinkSectionsSnapshot,
+} from "@landscape-router/types/api/schemas";
 import {
   canManageBridgeAttachment,
   getBridgeAttachIssue,
@@ -145,6 +148,46 @@ interface RuntimeRow {
   label: string;
   display: RuntimeDisplay;
   details?: string[];
+  time?: number;
+  time_label?: string;
+}
+
+function v4_lease_secs(rt: WanLinkSectionsSnapshot["v4"]): number | undefined {
+  if (rt.t === "dhcp" && "bound" in rt) {
+    return rt.bound.lease_secs;
+  }
+  return undefined;
+}
+
+function v4_connected_secs(
+  rt: WanLinkSectionsSnapshot["v4"],
+): number | undefined {
+  let connected_at: number | undefined;
+  if (rt.t === "pppoe" && "online" in rt) {
+    connected_at = rt.online.connected_at;
+  } else if (rt.t === "pppd" && "online" in rt) {
+    connected_at = rt.online.connected_at;
+  }
+  if (connected_at === undefined || !Number.isFinite(connected_at)) {
+    return undefined;
+  }
+  return Math.max(0, Math.floor((Date.now() - connected_at) / 1000));
+}
+
+function pd_lease(rt: WanLinkSectionsSnapshot["pd"]): PdLease | undefined {
+  if (typeof rt === "string") {
+    return undefined;
+  }
+  if ("bound" in rt) {
+    return rt.bound;
+  }
+  if ("renewing" in rt) {
+    return rt.renewing;
+  }
+  if ("rebinding" in rt) {
+    return rt.rebinding;
+  }
+  return undefined;
 }
 
 const runtime_rows = computed<RuntimeRow[]>(() => {
@@ -155,21 +198,41 @@ const runtime_rows = computed<RuntimeRow[]>(() => {
   }
   const rows: RuntimeRow[] = [];
   if (link.v4.enable) {
+    const connected_secs = v4_connected_secs(snapshot.v4);
     rows.push({
       label: t("topology.panel.runtime_v4"),
       display: formatV4Runtime(snapshot.v4, runtime_rt, runtime_mask),
+      time: v4_lease_secs(snapshot.v4) ?? connected_secs,
+      time_label:
+        connected_secs === undefined
+          ? undefined
+          : t("topology.panel.runtime_connected"),
     });
   }
   if (link.pd.enable) {
+    const lease = pd_lease(snapshot.pd);
+    if (lease?.wan_ip) {
+      rows.push({
+        label: t("topology.panel.runtime_ipv6"),
+        display: { text: runtime_mask(lease.wan_ip), tone: "success" },
+      });
+    }
     rows.push({
       label: t("topology.panel.runtime_pd"),
       display: formatPdRuntime(snapshot.pd, runtime_rt, runtime_mask),
+      time: lease?.preferred_secs,
     });
   }
   if (link.nat.enable) {
     rows.push({
-      label: t("topology.panel.runtime_nat"),
-      display: formatServiceStatus(snapshot.nat, runtime_rt),
+      label: t("topology.panel.runtime_nat4"),
+      display: formatServiceStatus(snapshot.nat4, runtime_rt),
+    });
+  }
+  if (link.nat.enable && link.pd.enable) {
+    rows.push({
+      label: t("topology.panel.runtime_nat6"),
+      display: formatServiceStatus(snapshot.nat6, runtime_rt),
     });
   }
   if (link.mss.enable) {
@@ -723,7 +786,14 @@ async function handleDeleteBridge() {
                       round
                       :type="row.display.tone"
                     >
-                      {{ row.display.text }}
+                      {{ row.display.text
+                      }}<template v-if="row.time !== undefined">
+                        ·
+                        <template v-if="row.time_label">
+                          {{ row.time_label }}:
+                        </template>
+                        <DurationTime :seconds="row.time" mode="detailed"
+                      /></template>
                     </n-tag>
                     <span
                       v-for="detail in row.details ?? []"

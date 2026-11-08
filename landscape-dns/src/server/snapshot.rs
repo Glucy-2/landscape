@@ -4,29 +4,24 @@ use arc_swap::ArcSwap;
 #[cfg(test)]
 use arc_swap::Guard;
 
+use landscape_common::dns::CacheRuntimeConfig;
 use landscape_common::flow::{DnsResultSink, FlowMarkInfo};
 
 use crate::{
-    CacheDNSItem,
     domain::ParsedDomain,
-    server::{
-        CacheRuntimeConfig, cache::CacheHandle, local::LocalResolver,
-        redirect_engine::RedirectEngine, resolve_engine::ResolveEngine, rule::DNSResolveRuntime,
+    resolve::{
+        RuntimeSnapshot,
+        cache::{CacheDNSItem, CacheHandle},
+        engine::ResolveEngine,
+        local::LocalResolver,
+        redirect::RedirectEngine,
+        rule::DNSResolveRuntime,
     },
 };
 
 /// Migrated cache entries keep a TTL at most this long when rules are
 /// refreshed, so stale answers converge quickly after a config change.
 pub(crate) const RULE_REFRESH_TTL_CAP: u32 = 5;
-
-/// Immutable, atomically swappable view of the DNS resolution state: the two
-/// rule engines and the cache they share.
-#[derive(Debug)]
-pub(crate) struct RuntimeSnapshot {
-    pub redirect_engine: Arc<RedirectEngine>,
-    pub resolve_engine: Arc<ResolveEngine>,
-    pub cache: CacheHandle,
-}
 
 /// What part of the runtime snapshot to replace on a config refresh.
 pub(crate) enum SnapshotPatch {

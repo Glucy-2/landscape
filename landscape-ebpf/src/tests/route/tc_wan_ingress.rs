@@ -35,21 +35,17 @@ use libbpf_rs::{
 use zerocopy::IntoBytes;
 
 use crate::tests::{
-    TestSkb, isolated_pin_root,
-    route::{
-        map_helper::{
-            LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE, WAN_IFINDEX,
-            WAN_ROUTE_TYPE, as_bytes, create_route4_cache_inner_map, insert_ip_mac_v4,
-            insert_route4_lan_entry, lookup_rt4_cache_value, put_rt4_cache_value,
-        },
-        packet_builder::{simple_ipv4_tcp, simple_ipv6_tcp_syn},
+    TestSkb,
+    helper::map::{
+        LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE, WAN_IFINDEX,
+        WAN_ROUTE_TYPE, as_bytes, create_route4_cache_inner_map, insert_ip_mac_v4,
+        insert_route4_lan_entry, lookup_rt4_cache_value, put_rt4_cache_value,
     },
+    isolated_pin_root,
+    pkt::{simple_ipv4_tcp, simple_ipv6_tcp_syn},
 };
 
-pub(crate) mod tc_wan_ingress_route {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_wan_ingress_route.skel.rs"));
-}
-use tc_wan_ingress_route::TcWanIngressRouteSkel;
+use crate::skel::tc_wan_ingress_route::TcWanIngressRouteSkel;
 
 const RET_OK: i32 = 0;
 const RET_UNSPEC: i32 = -1;
@@ -83,7 +79,8 @@ fn wan_ctx(mark: u32) -> TestSkb {
 macro_rules! load_skel {
     ($pin:expr, $skel:ident) => {
         let pin_root = isolated_pin_root($pin);
-        let mut builder = tc_wan_ingress_route::TcWanIngressRouteSkelBuilder::default();
+        let mut builder =
+            crate::skel::tc_wan_ingress_route::TcWanIngressRouteSkelBuilder::default();
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = std::mem::MaybeUninit::uninit();
         let $skel = builder.open(&mut open_object).unwrap().load().unwrap();
@@ -543,9 +540,13 @@ fn wan_ingress_arp_frame_passes_through() {
     assert_eq!(out, pkt);
 }
 
-// NOTE: LD_SCAN_ERR (eth-header read failure) is not reachable under
+// NOTE: the eth-header read failure is not reachable under
 // PROG_TEST_RUN: the kernel rejects data_size_in < ETH_HLEN before the
-// program runs (test_run.c `if (size < ETH_HLEN) return -EINVAL`).
+// program runs (test_run.c `if (size < ETH_HLEN) return -EINVAL`), and
+// rejects ethertype-IP inputs whose L3 header would be truncated
+// (< ETH_HLEN + sizeof(struct iphdr) for IPv4, + sizeof(struct ipv6hdr)
+// for IPv6). The truncation tests below therefore overrun the header read
+// via an l3 offset of 15 instead of a short frame.
 
 #[test]
 fn wan_ingress_non_matching_wan_binding_continues_to_lan_redirect() {
@@ -721,14 +722,16 @@ fn wan_ingress_ipv6_frame_hands_to_stack() {
 
 #[test]
 fn wan_ingress_truncated_ip_header_passes_to_stack() {
-    // read_context truncation row: ethertype claims IPv4 but the IP header
-    // is cut short → SHOT from read_context, mapped to "pass to the stack".
+    // read_context truncation row: cb[1] overruns the L3 header read → SHOT,
+    // mapped to "pass" (PROG_TEST_RUN rejects short frames, see NOTE above).
     load_skel!("tc-wan-in-flow-runt", skel);
-    let mut pkt = vec![0xff_u8; 16]; // eth header + 2 bytes of "IP"
+    let mut pkt = vec![0xff_u8; 14 + 20]; // eth + full-size "IP" payload
     pkt[12] = 0x08;
     pkt[13] = 0x00;
+    let mut ctx = wan_ctx(0);
+    ctx.cb[1] = 15; // 15 + 20 > 34 → header read overruns
 
-    let (ret, out) = run_wan_ingress(&skel, &pkt, &mut wan_ctx(0));
+    let (ret, out) = run_wan_ingress(&skel, &pkt, &mut ctx);
 
     assert_eq!(ret, RET_OK, "truncated IP header must pass, not drop");
     assert_eq!(out, pkt);

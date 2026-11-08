@@ -1,10 +1,15 @@
 use super::*;
-use crate::server::LocalDnsAnswerProvider;
+use crate::resolve::LocalDnsAnswerProvider;
 use arc_swap::{ArcSwap, ArcSwapOption};
-use landscape_common::dns::rule::FilterResult;
+use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::Record;
+use landscape_common::dns::redirect::{DNSRedirectRuntimeRule, DnsRedirectAnswerMode};
+use landscape_common::dns::rule::{DomainConfig, DomainMatchType, FilterResult};
 use landscape_common::flow::{DnsRuntimeMarkInfo, NoopDnsResultSink};
+use landscape_common::metric::dns::DnsOutcome;
 use landscape_common::sys_service::lan_hostname::LanHostnameConfig;
 use landscape_core::lan_device::LanDeviceDirectory;
+use std::net::IpAddr;
 use uuid::Uuid;
 
 #[derive(Default, Debug)]
@@ -26,22 +31,24 @@ impl DnsRequestHandler {
         Self::from_engines(
             redirect_engine,
             resolve_engine,
-            runtime_config,
-            flow_id,
-            msg_tx,
-            local_resolver,
-            Arc::new(NoopDnsResultSink),
+            HandlerDeps {
+                runtime_config,
+                flow_id,
+                msg_tx,
+                local_resolver,
+                sink: Arc::new(NoopDnsResultSink),
+            },
         )
     }
 
     fn test_engines_from_legacy(init: ChainDnsServerInitInfo) -> (RedirectEngine, ResolveEngine) {
         use std::collections::BTreeMap;
 
-        use crate::connection::pool::ResolvePool;
-        use crate::server::{
+        use crate::resolve::{
             matcher::RuntimeRuleMatcher,
             rule::{DNSRedirectRuntime, DNSResolveRuntime, RedirectRuleParams, ResolveRuleParams},
         };
+        use crate::upstream::pool::ResolvePool;
         let pool = Arc::new(ResolvePool::default());
 
         let redirects = init
@@ -97,7 +104,7 @@ impl DnsRequestHandler {
         let runtime = self.snapshot.load_full();
         runtime
             .cache
-            .insert(crate::server::cache::CacheEntry {
+            .insert(crate::resolve::cache::CacheEntry {
                 domain_key: Arc::<str>::from(domain),
                 query_type,
                 rdatas: rdata_ttl_vec,
@@ -109,6 +116,46 @@ impl DnsRequestHandler {
             })
             .await;
     }
+}
+
+/// Handler for listener-level end-to-end tests: a single static redirect rule
+/// answering `domain` with `addr`, no upstreams.
+pub(crate) fn redirect_test_handler(
+    domain: &str,
+    addr: IpAddr,
+    ttl_secs: u32,
+) -> DnsRequestHandler {
+    DnsRequestHandler::new(
+        ChainDnsServerInitInfo {
+            dns_rules: vec![],
+            redirect_rules: vec![DNSRedirectRuntimeRule {
+                redirect_id: Some(Uuid::nil()),
+                dynamic_redirect_source: None,
+                answer_mode: DnsRedirectAnswerMode::StaticIps,
+                match_rules: vec![DomainConfig {
+                    match_type: DomainMatchType::Full,
+                    value: domain.to_string(),
+                }],
+                result_info: vec![addr],
+                ttl_secs,
+                block_metadata_queries: true,
+            }],
+        },
+        Arc::new(ArcSwap::from_pointee(CacheRuntimeConfig {
+            cache_capacity: 16,
+            cache_ttl: 60,
+            negative_cache_ttl: 5,
+        })),
+        1,
+        Arc::new(ArcSwapOption::new(None)),
+        Arc::new(LocalResolver::new(
+            LanDeviceDirectory::new_for_test(),
+            Arc::new(ArcSwap::from_pointee(LanHostnameConfig::default())),
+            None,
+            None,
+            None,
+        )),
+    )
 }
 
 #[allow(clippy::module_inception)]

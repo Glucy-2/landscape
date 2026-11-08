@@ -1,5 +1,9 @@
 name: Code Quality Check
 
+defaults:
+  run:
+    shell: bash
+
 on:
   push:
     branches:
@@ -13,16 +17,14 @@ on:
 
 jobs:
   rust-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang gcc make pkg-config libelf-dev libclang-dev zlib1g-dev
+      - name: Install build toolchain
+        run: ./scripts/setup_ubuntu_build.sh
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,18 +32,29 @@ jobs:
           toolchain: 1.98.0
           components: rustfmt, clippy
 
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Configure sccache
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', process.env.ACTIONS_CACHE_SERVICE_V2 || 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Setup sccache
         run: |
           wget -qO- https://github.com/mozilla/sccache/releases/download/v0.12.0/sccache-v0.12.0-x86_64-unknown-linux-musl.tar.gz | sudo tar -xzf - -C /usr/local/bin/ --strip-components=1
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-
-      - name: Setup cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/sccache
-          key: ${{ runner.os }}-check-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-check-
+          echo "SCCACHE_GHA_ENABLED=on" >> $GITHUB_ENV
 
       - name: Check Rust code
         run: cargo check --locked --workspace --features metric-persistent
@@ -56,17 +69,19 @@ jobs:
           cargo clippy --locked -p landscape-common --features mem-track -- -D warnings
           cargo clippy --locked -p landscape-common --features openapi -- -D warnings
 
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   config-cli-e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang gcc make pkg-config libelf-dev libclang-dev zlib1g-dev
+      - name: Install build toolchain
+        run: ./scripts/setup_ubuntu_build.sh
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -74,20 +89,29 @@ jobs:
           toolchain: 1.98.0
           components: rustfmt, clippy
 
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Configure sccache
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', process.env.ACTIONS_CACHE_SERVICE_V2 || 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Setup sccache
         run: |
           wget -qO- https://github.com/mozilla/sccache/releases/download/v0.12.0/sccache-v0.12.0-x86_64-unknown-linux-musl.tar.gz | sudo tar -xzf - -C /usr/local/bin/ --strip-components=1
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-
-      - name: Setup cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/sccache
-          key: ${{ runner.os }}-e2e-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-e2e-
-            ${{ runner.os }}-check-
+          echo "SCCACHE_GHA_ENABLED=on" >> $GITHUB_ENV
 
       - name: Run landscape-common unit tests
         run: cargo test --locked -p landscape-common --lib
@@ -97,6 +121,10 @@ jobs:
 
       - name: Run config CLI end-to-end tests
         run: ./scripts/config_cli_test.sh target/debug/landscape-webserver
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
   rust-format-check:
     runs-on: ubuntu-latest
@@ -109,7 +137,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Check Rust version
         run: rustc --version
@@ -150,7 +178,7 @@ jobs:
           node-version: 22
           cache: 'pnpm'
 
-      - name: Install dependencies
+      - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Check frontend code formatting

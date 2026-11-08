@@ -1,37 +1,47 @@
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 
 use libbpf_rs::{
-    TC_EGRESS,
+    MapCore,
     skel::{OpenSkel, SkelBuilder},
 };
 
 use crate::{
-    PPPOE_EGRESS_PRIORITY,
     bpf_error::LdEbpfResult,
-    bpf_rs_shared::pppoe_skb_fallback_skel,
-    chain::xdp_manager::SkbPending,
-    landscape::{OwnedOpenObject, TcHookProxy},
-    runtime::EbpfRuntime,
+    chain::stage::{FamilyProg, FromLanStageType, StageFamily},
+    chain::wan_link::WanLinkDataplane,
+    landscape::{OwnedOpenObject, pin_and_reuse_map},
     stages::pppoe::XdpPppoeHandle,
+    xdp_attach::SkbPending,
 };
 
-mod tc_pppoe_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_pppoe.skel.rs"));
+pub use crate::skel::tc_pppoe::types::pppoe_egress_tmpl as PppoeEgressTmpl;
+
+/// Per-link terminal TC egress stage: the encap program lives at the
+/// end of this link's WAN egress chain with the link's session
+/// template baked into rodata, so it only touches packets that
+/// traversed this chain (multi-link-per-iface safe once the chains
+/// are chain-keyed).
+struct TcPppoeStage {
+    dp: Arc<WanLinkDataplane>,
+    _skel: crate::skel::tc_pppoe::TcPppoeSkel<'static>,
+    _backing: OwnedOpenObject,
 }
 
-pub use tc_pppoe_skel::types::pppoe_egress_tmpl as PppoeEgressTmpl;
-
-struct StandalonePppoe {
-    _skel: tc_pppoe_skel::TcPppoeSkel<'static>,
-    _backing: OwnedOpenObject,
-    _hook: TcHookProxy,
+impl Drop for TcPppoeStage {
+    fn drop(&mut self) {
+        for family in StageFamily::ALL {
+            self.dp.tc().remove_from_lan(FromLanStageType::Pppoe, family);
+        }
+    }
 }
 
 pub struct PppoeHandle {
-    runtime: Arc<EbpfRuntime>,
-    _tc: StandalonePppoe,
+    dp: Arc<WanLinkDataplane>,
+    _tc: TcPppoeStage,
     _xdp: XdpPppoeHandle,
     _ifindex: u32,
+    session_id: u16,
 }
 
 unsafe impl Send for PppoeHandle {}
@@ -39,60 +49,97 @@ unsafe impl Sync for PppoeHandle {}
 
 impl Drop for PppoeHandle {
     fn drop(&mut self) {
-        let _ = self.runtime.xdp.take_skb_pending(self._ifindex);
-        let _ = self.runtime.xdp.take_skb_bundle(self._ifindex);
+        // Remove this link's session; the last link out also detaches
+        // and forgets the shared SKB fallback program.
+        self.dp.attach().release_pppoe_skb_fallback(self._ifindex, self.session_id);
     }
 }
 
 pub fn create_pppoe_handle(
-    rt: Arc<EbpfRuntime>,
+    dp: Arc<WanLinkDataplane>,
     ifindex: u32,
     tmpl: PppoeEgressTmpl,
     _mtu: u16,
 ) -> LdEbpfResult<PppoeHandle> {
     let session_id = u16::from_be(tmpl.session_id);
 
-    let tc = attach_standalone_pppoe(ifindex, tmpl)?;
-    let xdp = crate::stages::pppoe::init_xdp_pppoe(&rt, ifindex, session_id)?;
-    let pending = prepare_pppoe_skb_pending(ifindex, session_id)?;
-    rt.xdp.set_skb_pending(ifindex, pending);
+    let tc = attach_tc_pppoe(&dp, tmpl)?;
+    let xdp = crate::stages::pppoe::init_xdp_pppoe(&dp, session_id)?;
+    dp.attach().acquire_pppoe_skb_fallback(
+        ifindex,
+        session_id,
+        dp.id(),
+        prepare_pppoe_skb_fallback,
+    )?;
 
     Ok(PppoeHandle {
-        runtime: rt.clone(),
+        dp: dp.clone(),
         _tc: tc,
         _xdp: xdp,
         _ifindex: ifindex,
+        session_id,
     })
 }
 
-fn attach_standalone_pppoe(ifindex: u32, tmpl: PppoeEgressTmpl) -> LdEbpfResult<StandalonePppoe> {
-    let builder = tc_pppoe_skel::TcPppoeSkelBuilder::default();
+fn attach_tc_pppoe(
+    dp: &Arc<WanLinkDataplane>,
+    tmpl: PppoeEgressTmpl,
+) -> LdEbpfResult<TcPppoeStage> {
+    let paths = dp.backbone().paths();
+
+    let builder = crate::skel::tc_pppoe::TcPppoeSkelBuilder::default();
     let (backing, obj) = OwnedOpenObject::new();
     let mut open_skel = crate::bpf_ctx!(builder.open(obj), "open tc_pppoe skeleton")?;
 
     open_skel.maps.rodata_data.as_deref_mut().unwrap().pppoe_tmpl = tmpl;
 
+    pin_and_reuse_map(
+        &mut open_skel.maps.tc_pipe_exits_wan_ingress,
+        &paths.tc_pipe_exits_wan_ingress_path(),
+    )?;
+    pin_and_reuse_map(
+        &mut open_skel.maps.tc_pipe_exits_wan_egress,
+        &paths.tc_pipe_exits_wan_egress_path(),
+    )?;
+
     let skel = crate::bpf_ctx!(open_skel.load(), "load tc_pppoe skeleton")?;
 
-    let mut hook = TcHookProxy::new(
-        &skel.progs.tc_pppoe_wan_egress,
-        ifindex as i32,
-        TC_EGRESS,
-        PPPOE_EGRESS_PRIORITY,
-    );
-    hook.attach();
+    // Egress-only terminal stage (decap happens at the intro dispatch).
+    let next_egress_fd = skel.maps.wan_egress_next_stage.as_fd().as_raw_fd();
+    for (family, prog_fd) in [
+        (StageFamily::V4, skel.progs.tc_pppoe_wan_egress_v4.as_fd().as_raw_fd()),
+        (StageFamily::V6, skel.progs.tc_pppoe_wan_egress_v6.as_fd().as_raw_fd()),
+    ] {
+        dp.tc().inject_from_lan(
+            FromLanStageType::Pppoe,
+            family,
+            FamilyProg { prog_fd, next_stage_map_fd: next_egress_fd },
+        )?;
+    }
 
-    Ok(StandalonePppoe { _skel: skel, _backing: backing, _hook: hook })
+    Ok(TcPppoeStage { dp: dp.clone(), _skel: skel, _backing: backing })
 }
 
-fn prepare_pppoe_skb_pending(_ifindex: u32, session_id: u16) -> LdEbpfResult<SkbPending> {
-    let builder = pppoe_skb_fallback_skel::PppoeSkbFallbackSkelBuilder::default();
+/// The shared per-iface SKB fallback decap program; each link publishes
+/// its own session into the instance's `pppoe_sessions` map.
+fn prepare_pppoe_skb_fallback() -> LdEbpfResult<(SkbPending, libbpf_rs::MapHandle)> {
+    let builder = crate::skel::pppoe_skb_fallback::PppoeSkbFallbackSkelBuilder::default();
     let (backing, obj) = OwnedOpenObject::new();
-    let mut open_skel = crate::bpf_ctx!(builder.open(obj), "open pppoe_skb_fallback skeleton")?;
-    if let Some(rodata) = open_skel.maps.rodata_data.as_deref_mut() {
-        rodata.session_id = session_id.to_be();
-    }
+    let open_skel = crate::bpf_ctx!(builder.open(obj), "open pppoe_skb_fallback skeleton")?;
     let skel = crate::bpf_ctx!(open_skel.load(), "load pppoe_skb_fallback skeleton")?;
 
-    Ok(SkbPending::new(backing, skel))
+    let info = skel.maps.pppoe_sessions.info().map_err(|e| {
+        crate::bpf_error::LandscapeEbpfError::Context {
+            context: "pppoe_sessions map info failed".to_string(),
+            source: e,
+        }
+    })?;
+    let map = libbpf_rs::MapHandle::from_map_id(info.info.id).map_err(|e| {
+        crate::bpf_error::LandscapeEbpfError::Context {
+            context: "pppoe_sessions map handle from id failed".to_string(),
+            source: e,
+        }
+    })?;
+
+    Ok((SkbPending::new(backing, skel), map))
 }

@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,10 +10,60 @@ use std::thread::{available_parallelism, scope};
 use libbpf_cargo::SkeletonBuilder;
 
 /// Bump to invalidate every skeleton cache entry after changing generation logic.
-const SKELETON_GEN_VERSION: u64 = 2;
+const SKELETON_GEN_VERSION: u64 = 3;
+
+/// BPF arena pointer accesses require `addr_space_cast`, which LLVM only
+/// emits correctly starting with Clang 19. Clang 18 and older compile the
+/// code successfully but produce a verifier-rejected program.
+const MIN_CLANG_MAJOR: u32 = 19;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn clang_binary() -> OsString {
+    env::var_os("CLANG").unwrap_or_else(|| OsString::from("clang"))
+}
+
+fn check_clang(clang: &OsStr) -> Vec<u8> {
+    let output = Command::new(clang).arg("--version").output().unwrap_or_else(|e| {
+        panic!(
+            "failed to execute `{}`: {e}. Install Clang {MIN_CLANG_MAJOR}+ and set CLANG \
+             to its path if necessary",
+            Path::new(clang).display()
+        )
+    });
+    assert!(
+        output.status.success(),
+        "`{} --version` failed with status {}",
+        Path::new(clang).display(),
+        output.status
+    );
+
+    let version = String::from_utf8_lossy(&output.stdout);
+    let first_line = version.lines().next().unwrap_or("<empty>");
+    let major = first_line
+        .split_whitespace()
+        .find_map(|word| {
+            let word = word.trim_start_matches('v');
+            let mut parts = word.split('.');
+            let major = parts.next()?.parse::<u32>().ok()?;
+            // Require at least major.minor so unrelated numeric tokens do
+            // not get mistaken for the compiler version.
+            parts.next()?;
+            Some(major)
+        })
+        .unwrap_or_else(|| panic!("failed to parse Clang version from: {first_line}"));
+
+    assert!(
+        major >= MIN_CLANG_MAJOR,
+        "landscape-ebpf requires Clang {MIN_CLANG_MAJOR}+, found: {first_line}. \
+         Clang 19+ is required to emit BPF arena `addr_space_cast` instructions. \
+         Install clang-19 and set CLANG to its path."
+    );
+
+    println!("cargo:warning=BPF compiler: {first_line}");
+    output.stdout
+}
 
 fn emit_rerun_if_changed(path: &Path) {
     println!("cargo:rerun-if-changed={}", path.display());
@@ -69,13 +119,16 @@ fn collect_bpf_in_dir(dir: &Path, project_root: &Path, jobs: &mut Vec<BpfJob>) {
     }
 }
 
-fn collect_test_bpf(base_dir: &Path, project_root: &Path, jobs: &mut Vec<BpfJob>) {
-    let test_dir = base_dir.join("tests");
-    if !test_dir.is_dir() {
+/// Collect the `bpf-test`-only BPF trees: correctness-test programs under
+/// `src/bpf/tests/` and benchmarks under `src/bpf/bench/`. `.bpf.c` files may
+/// sit at either level of those trees.
+fn collect_aux_bpf(dir: &Path, project_root: &Path, jobs: &mut Vec<BpfJob>) {
+    if !dir.is_dir() {
         return;
     }
-    for entry in fs::read_dir(&test_dir).unwrap_or_else(|e| {
-        panic!("Failed to read test directory: {}: {}", test_dir.display(), e);
+    collect_bpf_in_dir(dir, project_root, jobs);
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!("Failed to read BPF directory: {}: {}", dir.display(), e);
     }) {
         let path = match entry {
             Ok(entry) => entry.path(),
@@ -165,7 +218,12 @@ fn lock_packages_fingerprint(lock_path: &Path) -> Vec<u8> {
 
 /// Everything that affects all skeletons: generator version, arch, clang args,
 /// vmlinux headers, shared BPF headers, clang binary, and libbpf toolchain.
-fn environment_key(target_arch: &str, clang_args: &[&OsStr], vmlinux_path: &Path) -> u64 {
+fn environment_key(
+    target_arch: &str,
+    clang_args: &[&OsStr],
+    vmlinux_path: &Path,
+    clang_version: &[u8],
+) -> u64 {
     let mut key = KeyBuilder::new();
     key.field(&SKELETON_GEN_VERSION.to_le_bytes());
     key.field(target_arch.as_bytes());
@@ -181,9 +239,7 @@ fn environment_key(target_arch: &str, clang_args: &[&OsStr], vmlinux_path: &Path
     }
     hash_headers(Path::new("src/bpf"), &mut key);
 
-    let clang_version =
-        Command::new("clang").arg("--version").output().map(|o| o.stdout).unwrap_or_default();
-    key.field(&clang_version);
+    key.field(clang_version);
 
     if let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR") {
         let lock = Path::new(&manifest_dir).join("../Cargo.lock");
@@ -217,7 +273,7 @@ fn worker_count() -> usize {
 
 /// Build one skeleton unless the cached hash says generation inputs are
 /// unchanged. Returns `true` when clang actually ran.
-fn build_one(job: &BpfJob, key: u64, clang_args: &[&OsStr]) -> Result<bool, String> {
+fn build_one(job: &BpfJob, key: u64, clang_args: &[&OsStr], clang: &OsStr) -> Result<bool, String> {
     let key_str = format!("{key:016x}");
     if job.skel.exists() && fs::read_to_string(&job.hash).is_ok_and(|h| h.trim() == key_str) {
         return Ok(false);
@@ -226,14 +282,15 @@ fn build_one(job: &BpfJob, key: u64, clang_args: &[&OsStr]) -> Result<bool, Stri
     println!("Building BPF skeleton: {}", job.source.display());
     SkeletonBuilder::new()
         .source(&job.source)
+        .clang(clang)
         .clang_args(clang_args)
         .build_and_generate(&job.skel)
-        .map_err(|e| format!("{}: {e}", job.source.display()))?;
+        .map_err(|e| format!("{}: {:?}", job.source.display(), e))?;
     fs::write(&job.hash, &key_str).map_err(|e| format!("{}: {e}", job.hash.display()))?;
     Ok(true)
 }
 
-fn run_jobs(jobs: &[(BpfJob, u64)], clang_args: &[&OsStr]) {
+fn run_jobs(jobs: &[(BpfJob, u64)], clang_args: &[&OsStr], clang: &OsStr) {
     if jobs.is_empty() {
         return;
     }
@@ -248,7 +305,7 @@ fn run_jobs(jobs: &[(BpfJob, u64)], clang_args: &[&OsStr]) {
         let Some((job, key)) = jobs.get(i) else {
             break;
         };
-        match build_one(job, *key, clang_args) {
+        match build_one(job, *key, clang_args, clang) {
             Ok(true) => {
                 built.fetch_add(1, Ordering::Relaxed);
             }
@@ -296,6 +353,10 @@ fn main() {
 
     println!("build target arch is: {}", target_arch);
 
+    println!("cargo:rerun-if-env-changed=CLANG");
+    let clang = clang_binary();
+    let clang_version = check_clang(&clang);
+
     emit_rerun_if_changed(Path::new("src/bpf"));
 
     let vmlinux_path = vmlinux::include_path_root().join(&target_arch);
@@ -313,13 +374,36 @@ fn main() {
         clang_args.push(OsStr::new("-DLAND_ARCH_RISCV"));
     }
 
+    /// Test/bench feature -> BPF source directories (relative to crate root).
+    /// `test-nat` also pulls `chain/` because the NAT session tests reuse the
+    /// chain helpers' `test_xdp_dummy` program. Directories may be requested
+    /// by several features; jobs are deduplicated below.
+    const FEATURE_TEST_DIRS: &[(&str, &[&str])] = &[
+        ("test-route", &["src/bpf/tests/route"]),
+        ("test-nat", &["src/bpf/tests/nat", "src/bpf/tests/chain"]),
+        ("test-reader", &["src/bpf/tests/reader"]),
+        ("test-chain", &["src/bpf/tests/chain"]),
+        ("test-metric", &["src/bpf/tests/metric"]),
+        ("test-misc", &["src/bpf/tests/misc"]),
+        ("bench", &["src/bpf/bench"]),
+    ];
+
     let mut jobs = Vec::new();
     collect_bpf_in_dir(Path::new("src/bpf/"), &project_root, &mut jobs);
-    if env::var_os("CARGO_FEATURE_BPF_TEST").is_some() {
-        collect_test_bpf(Path::new("src/bpf"), &project_root, &mut jobs);
+    for (feature, dirs) in FEATURE_TEST_DIRS {
+        let env_var = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
+        if env::var_os(&env_var).is_some() {
+            for dir in *dirs {
+                collect_aux_bpf(Path::new(dir), &project_root, &mut jobs);
+            }
+        }
     }
+    // A feature set can request the same directory twice (e.g. test-nat +
+    // test-chain both pull src/bpf/tests/chain); keep one job per source.
+    jobs.sort_by(|a, b| a.source.cmp(&b.source));
+    jobs.dedup_by(|a, b| a.source == b.source);
 
-    let env_key = environment_key(&target_arch, &clang_args, &vmlinux_path);
+    let env_key = environment_key(&target_arch, &clang_args, &vmlinux_path, &clang_version);
     let keyed: Vec<(BpfJob, u64)> = jobs
         .into_iter()
         .map(|job| {
@@ -327,5 +411,5 @@ fn main() {
             (job, key)
         })
         .collect();
-    run_jobs(&keyed, &clang_args);
+    run_jobs(&keyed, &clang_args, &clang);
 }

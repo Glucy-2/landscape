@@ -5,26 +5,19 @@ use std::sync::Arc;
 
 use crate::bpf_ctx;
 use crate::bpf_error::LdEbpfResult;
-use crate::chain::xdp_manager::NativeXdpLink;
 use crate::landscape::{OwnedOpenObject, TcHookProxy, pin_and_reuse_map};
 use crate::runtime::EbpfRuntime;
+use crate::xdp_attach::NativeXdpLink;
 
-pub(crate) mod xdp_lan_route_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/xdp_lan_route.skel.rs"));
-}
+use crate::skel::xdp_lan_route::XdpLanRouteSkelBuilder;
 
-use xdp_lan_route_skel::XdpLanRouteSkelBuilder;
-
-mod tc_lan_ingress_route_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_lan_ingress_route.skel.rs"));
-}
-use tc_lan_ingress_route_skel::TcLanIngressRouteSkelBuilder;
+use crate::skel::tc_lan_ingress_route::TcLanIngressRouteSkelBuilder;
 
 pub struct XdpLanRouteHandle {
     _link: NativeXdpLink,
-    _skel: xdp_lan_route_skel::XdpLanRouteSkel<'static>,
+    _skel: crate::skel::xdp_lan_route::XdpLanRouteSkel<'static>,
     _backing: OwnedOpenObject,
-    _intro_skel: tc_lan_ingress_route_skel::TcLanIngressRouteSkel<'static>,
+    _intro_skel: crate::skel::tc_lan_ingress_route::TcLanIngressRouteSkel<'static>,
     _intro_backing: OwnedOpenObject,
     ingress_hook: Option<TcHookProxy>,
     _ifindex: u32,
@@ -139,13 +132,13 @@ pub fn init_xdp_lan_route(
 
     let skel = bpf_ctx!(open_skel.load(), "load xdp_lan_route skeleton")?;
 
-    let link = NativeXdpLink::attach(rt.clone(), &skel.progs.xdp_lan_route, ifindex)?;
+    let link = rt.xdp_attach().attach_native(&skel.progs.xdp_lan_route, ifindex)?;
 
-    rt.xdp.ensure_roots(ifindex)?;
+    // LAN ifaces carry no chains of their own: xdp_lan_route is attached
+    // directly and reaches the WAN link chains through the tail-call
+    // arrays, whose roots the WAN link hub owns.
 
     // ── TC ingress intro (XDP handoff + normal TC processing) ──
-
-    rt.tc.ensure_roots(ifindex, has_eth_header)?;
 
     let (intro_backing, intro_obj) = OwnedOpenObject::new();
     let intro_builder = TcLanIngressRouteSkelBuilder::default();

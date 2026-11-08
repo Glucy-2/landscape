@@ -7,7 +7,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::maps::Inet6Bytes;
 
 /// LPM key of `flow_match_map`. The C tail is
-/// `union { u_inet_addr src_addr; struct { u8 mac[6]; } mac; }`, mirrored as
+/// `union { struct in6_addr src_addr; struct { u8 mac[6]; } mac; }`, mirrored as
 /// `[u8; 16]` plus accessors.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, FromBytes, IntoBytes, Immutable, PartialEq, Eq)]
@@ -36,7 +36,7 @@ impl FlowMatchKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::xdp_wan_route::xdp_wan_route_skel::types as share;
+    use crate::skel::xdp_wan_route::types as share;
 
     #[test]
     fn flow_match_key_layouts_match_skel() {

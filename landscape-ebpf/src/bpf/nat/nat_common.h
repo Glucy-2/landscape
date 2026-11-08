@@ -1,7 +1,7 @@
 #ifndef LD_NAT_COMMON_H
 #define LD_NAT_COMMON_H
 #include <vmlinux.h>
-#include "base/landscape_log.h"
+#include "base/printk.h"
 #include "base/landscape.h"
 #include "base/proto_def.h"
 
@@ -41,9 +41,22 @@ const volatile u64 REPORT_INTERVAL = 1E9 * 5;
 
 #define READ_SKB_U16(skb_ptr, offset, var)                                                         \
     do {                                                                                           \
-        u16 *tmp_ptr;                                                                              \
-        if (VALIDATE_READ_DATA(skb_ptr, &tmp_ptr, offset, sizeof(*tmp_ptr))) return TC_ACT_SHOT;   \
-        var = *tmp_ptr;                                                                            \
+        struct __sk_buff *_skb = (skb_ptr);                                                        \
+        u32 _off = (offset);                                                                       \
+        if (_off > MAX_OFFSET - (u32)sizeof(var)) return TC_ACT_SHOT;                              \
+        char *_data = (char *)(long)_skb->data;                                                    \
+        char *_data_end = (char *)(long)_skb->data_end;                                            \
+        char *_p = _data + _off;                                                                   \
+        barrier_var(_p);                                                                           \
+        if (_p + sizeof(var) > _data_end) {                                                        \
+            if (bpf_skb_pull_data(_skb, _off + sizeof(var)) != 0) return TC_ACT_SHOT;              \
+            _data = (char *)(long)_skb->data;                                                      \
+            _data_end = (char *)(long)_skb->data_end;                                              \
+            _p = _data + _off;                                                                     \
+            barrier_var(_p);                                                                       \
+            if (_p + sizeof(var) > _data_end) return TC_ACT_SHOT;                                  \
+        }                                                                                          \
+        (var) = *(__be16 *)_p;                                                                     \
     } while (0)
 
 #define GRESS_MASK (1 << 0)
@@ -85,7 +98,7 @@ struct nat6_timer_value {
     u64 server_status;
     u64 client_status;
     u64 status;
-    inet6_addr trigger_addr;
+    struct in6_addr trigger_addr;
     u16 trigger_port;
     u8 is_allow_reuse;
     u8 flow_id;
@@ -130,10 +143,6 @@ enum nat6_static_result {
     NAT6_STATIC_REPLACE = 1,  // static mapping hit, client prefix must be replaced
     NAT6_STATIC_PASS = 2,     // static mapping hit, no prefix replace needed
 };
-
-static __always_inline bool pkt_can_begin_ct(u8 pkt_type) {
-    return pkt_type == PKT_CONNLESS_V2 || pkt_type == PKT_TCP_SYN_V2;
-}
 
 static __always_inline bool ct_try_set_status(u64 *status_in_value, u64 curr_state,
                                               u64 next_state) {

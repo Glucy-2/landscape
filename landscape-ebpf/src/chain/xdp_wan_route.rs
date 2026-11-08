@@ -5,31 +5,19 @@ use libbpf_rs::{TC_EGRESS, TC_INGRESS};
 
 use crate::bpf_ctx;
 use crate::bpf_error::LdEbpfResult;
-use crate::chain::xdp_manager::NativeXdpLink;
 use crate::landscape::{OwnedOpenObject, TcHookProxy, pin_and_reuse_map};
 use crate::runtime::EbpfRuntime;
+use crate::xdp_attach::NativeXdpLink;
 
-pub(crate) mod xdp_wan_route_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/xdp_wan_route.skel.rs"));
-}
-
-mod tc_wan_ingress_intro_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_wan_ingress_intro.skel.rs"));
-}
-
-mod tc_wan_egress_route_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_wan_egress_route.skel.rs"));
-}
-
-use tc_wan_egress_route_skel::TcWanEgressRouteSkelBuilder;
-use tc_wan_ingress_intro_skel::TcWanIngressIntroSkelBuilder;
+use crate::skel::tc_wan_egress_route::TcWanEgressRouteSkelBuilder;
+use crate::skel::tc_wan_ingress_intro::TcWanIngressIntroSkelBuilder;
 
 pub struct XdpWanRouteHandle {
     _link: NativeXdpLink,
-    _intro_skel: tc_wan_ingress_intro_skel::TcWanIngressIntroSkel<'static>,
+    _intro_skel: crate::skel::tc_wan_ingress_intro::TcWanIngressIntroSkel<'static>,
     _intro_backing: OwnedOpenObject,
     ingress_hook: Option<TcHookProxy>,
-    _egress_route_skel: tc_wan_egress_route_skel::TcWanEgressRouteSkel<'static>,
+    _egress_route_skel: crate::skel::tc_wan_egress_route::TcWanEgressRouteSkel<'static>,
     _egress_route_backing: OwnedOpenObject,
     egress_hook: Option<TcHookProxy>,
     _ifindex: u32,
@@ -55,17 +43,15 @@ pub fn init_xdp_wan_route(
 
     // ── XDP wan route ──
     //
-    // The WAN route/exit program is loaded once as a manager-lifetime
-    // singleton (XdpChainManager::new) and pinned into the shared
-    // `xdp_pipe_exits_wan` slot, so this handle only needs to bring up the
-    // chains for this interface and attach the intro dispatcher.
+    // The WAN route/exit program is loaded once as a backbone-lifetime
+    // singleton (RouteBackbone::new) and pinned into the shared
+    // `xdp_pipe_exits_wan` slot, so this handle only attaches the intro
+    // dispatcher; the chain roots themselves are owned by the per-link
+    // `WanLinkDataplane`, which loads them at construction.
 
-    rt.xdp.ensure_roots(ifindex)?;
-    let link = NativeXdpLink::attach(rt.clone(), rt.xdp.wan_intro_prog(), ifindex)?;
+    let link = rt.xdp_attach().attach_native(rt.backbone().wan_intro_prog(), ifindex)?;
 
     // ── TC ingress intro (XDP handoff + normal TC processing) ──
-
-    rt.tc.ensure_roots(ifindex, has_eth_header)?;
 
     let (intro_backing, intro_obj) = OwnedOpenObject::new();
     let intro_builder = TcWanIngressIntroSkelBuilder::default();
@@ -78,10 +64,8 @@ pub fn init_xdp_wan_route(
         &mut intro_open_skel.maps.tc_pipe_root_progs,
         &paths.tc_pipe_root_progs_path(),
     );
-    crate::maps::reuse_pinned_map_or_recreate(
-        &mut intro_open_skel.maps.wan_intro_dispatch_map,
-        &paths.tc_wan_intro_dispatch_path(),
-    );
+
+    rt.backbone().reuse_wan_trie_map(&mut intro_open_skel.maps.wan_trie_arena)?;
 
     let intro_skel = bpf_ctx!(intro_open_skel.load(), "load tc_wan_ingress_intro")?;
 

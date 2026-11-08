@@ -36,11 +36,11 @@ use libbpf_rs::{AsRawLibbpf, MapCore, MapFlags, MapHandle, MapType, OpenMapMut};
 pub use crate::LandscapeMapPath;
 use crate::bpf_error::LdEbpfResult;
 
-/// Typed accessors for the `u_inet_addr` / `u_inet6_addr` unions modeled as
+/// Typed accessors for the `struct in6_addr` address fields modeled as
 /// `[u8; 16]`.
 ///
-/// IPv4 reads/writes the `ip` variant (first 4 bytes, network order); IPv6
-/// maps to the `bits` variant (all 16 bytes, network order).
+/// IPv4 reads/writes the first 32-bit word (`in6_u.u6_addr32[0]`, network
+/// order); IPv6 maps to the 16-byte view (`in6_u.u6_addr8`, network order).
 pub(crate) trait Inet6Bytes: AsRef<[u8]> + AsMut<[u8]> {
     fn set_ipv4_be(&mut self, addr: u32) {
         self.as_mut()[..4].copy_from_slice(&addr.to_be_bytes());
@@ -114,11 +114,14 @@ pub mod firewall;
 pub mod flow;
 pub mod flow_dns;
 pub mod flow_wanip;
+pub mod frag;
 pub mod mac;
 pub mod nat;
 pub mod redirect_able;
 pub mod route;
 pub mod wan;
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod wan_trie;
 
 /// Only referenced by the aggregated layout tests in this module.
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -538,8 +541,11 @@ pub(crate) fn init_path(paths: &LandscapeMapPath) {
     wan::init_wan_ip_binding_map(&paths.wan_ip).expect("init wan_ip_binding failed");
     // NAT
     nat::init_nat6_static_map(&paths.nat6_static_map).expect("init nat6_static_map failed");
-    nat::init_nat4_static_map(&paths.nat4_static_map).expect("init nat4_static_map failed");
     nat::init_nat_metric_events(&paths.nat_metric_events).expect("init nat_metric_events failed");
+    frag::init_frag4_cache_lan_map(&paths.frag4_cache_lan).expect("init frag4_cache_lan failed");
+    frag::init_frag4_cache_wan_map(&paths.frag4_cache_wan).expect("init frag4_cache_wan failed");
+    frag::init_frag6_cache_lan_map(&paths.frag6_cache_lan).expect("init frag6_cache_lan failed");
+    frag::init_frag6_cache_wan_map(&paths.frag6_cache_wan).expect("init frag6_cache_wan failed");
 
     // firewall
     firewall::init_firewall_block_ip4_map(&paths.firewall_ipv4_block)
@@ -588,12 +594,16 @@ pub(crate) fn init_path(paths: &LandscapeMapPath) {
 /// expect under their `pin_root_path`). Integration tests use this to stand
 /// up the shared maps inside an isolated bpffs directory before loading the
 /// programs under test.
-#[cfg(all(test, feature = "bpf-test"))]
+#[cfg(all(test, feature = "test-support"))]
+#[cfg_attr(not(feature = "bpf-test"), allow(dead_code))]
 pub(crate) fn init_maps_for_test(paths: &LandscapeMapPath) {
     wan::init_wan_ip_binding_map(&paths.wan_ip).expect("test init wan_ip_binding");
     nat::init_nat6_static_map(&paths.nat6_static_map).expect("test init nat6_static_map");
-    nat::init_nat4_static_map(&paths.nat4_static_map).expect("test init nat4_static_map");
     nat::init_nat_metric_events(&paths.nat_metric_events).expect("test init nat_metric_events");
+    frag::init_frag4_cache_lan_map(&paths.frag4_cache_lan).expect("test init frag4_cache_lan");
+    frag::init_frag4_cache_wan_map(&paths.frag4_cache_wan).expect("test init frag4_cache_wan");
+    frag::init_frag6_cache_lan_map(&paths.frag6_cache_lan).expect("test init frag6_cache_lan");
+    frag::init_frag6_cache_wan_map(&paths.frag6_cache_wan).expect("test init frag6_cache_wan");
     firewall::init_firewall_block_ip4_map(&paths.firewall_ipv4_block)
         .expect("test init firewall_block_ip4_map");
     firewall::init_firewall_block_ip6_map(&paths.firewall_ipv6_block)
@@ -675,9 +685,7 @@ mod tests {
             Route6CacheKey,
             Route4SlotKey,
             Route6SlotKey,
-            NatMappingKeyV4,
             StaticNat6MappingKey,
-            Nat4TimerKey,
             Nat6TimerKey,
         );
     }
@@ -1008,7 +1016,7 @@ mod tests {
     fn spec_rejects_wrong_value_size() {
         use libbpf_rs::skel::SkelBuilder as _;
         let mut obj = std::mem::MaybeUninit::uninit();
-        let open = crate::stages::nat::xdp_nat_skel::XdpNatSkelBuilder::default()
+        let open = crate::skel::tc_wan_ingress_route::TcWanIngressRouteSkelBuilder::default()
             .open(&mut obj)
             .expect("open anchor skel");
         let spec = crate::maps::wan::WAN_IP_BINDING_SPEC;
@@ -1021,10 +1029,9 @@ mod tests {
     fn spec_rejects_inner_value_size_drift() {
         use libbpf_rs::skel::SkelBuilder as _;
         let mut obj = std::mem::MaybeUninit::uninit();
-        let open =
-            crate::chain::xdp_wan_route::xdp_wan_route_skel::XdpWanRouteSkelBuilder::default()
-                .open(&mut obj)
-                .expect("open anchor skel");
+        let open = crate::skel::xdp_wan_route::XdpWanRouteSkelBuilder::default()
+            .open(&mut obj)
+            .expect("open anchor skel");
         let spec = crate::maps::route::RT4_CACHE_MAP_SPEC;
         let inner = spec.inner.expect("cache outer has an inner template");
         let wrong = MapCreateSpec {
@@ -1039,10 +1046,9 @@ mod tests {
     fn spec_rejects_missing_inner_for_map_in_map() {
         use libbpf_rs::skel::SkelBuilder as _;
         let mut obj = std::mem::MaybeUninit::uninit();
-        let open =
-            crate::chain::xdp_wan_route::xdp_wan_route_skel::XdpWanRouteSkelBuilder::default()
-                .open(&mut obj)
-                .expect("open anchor skel");
+        let open = crate::skel::xdp_wan_route::XdpWanRouteSkelBuilder::default()
+            .open(&mut obj)
+            .expect("open anchor skel");
         let spec = crate::maps::route::RT4_CACHE_MAP_SPEC;
         let wrong = MapCreateSpec { inner: None, ..spec };
         crate::maps::assert_skel_map_matches(&open.maps.rt4_cache_map, &wrong);
@@ -1053,10 +1059,9 @@ mod tests {
     fn spec_rejects_wrong_map_type() {
         use libbpf_rs::skel::SkelBuilder as _;
         let mut obj = std::mem::MaybeUninit::uninit();
-        let open =
-            crate::chain::xdp_wan_route::xdp_wan_route_skel::XdpWanRouteSkelBuilder::default()
-                .open(&mut obj)
-                .expect("open anchor skel");
+        let open = crate::skel::xdp_wan_route::XdpWanRouteSkelBuilder::default()
+            .open(&mut obj)
+            .expect("open anchor skel");
         let spec = crate::maps::route::RT4_LAN_MAP_SPEC;
         let wrong = MapCreateSpec { map_type: MapType::Hash, ..spec };
         crate::maps::assert_skel_map_matches(&open.maps.rt4_lan_map, &wrong);
@@ -1069,7 +1074,7 @@ mod tests {
     fn init_path_creates_all_maps_and_reuses_on_restart() {
         use crate::LandscapeMapPath;
         use crate::maps::{
-            dns, firewall, flow, flow_dns, flow_wanip, mac, nat, redirect_able, route, wan,
+            dns, firewall, flow, flow_dns, flow_wanip, frag, mac, nat, redirect_able, route, wan,
         };
 
         let Some(_) = run_or_skip("init-path", |root| {
@@ -1078,13 +1083,16 @@ mod tests {
             init_path(&paths);
             for name in [
                 wan::WAN_IP_BINDING_PIN,
-                nat::NAT4_STATIC_MAP_PIN,
                 nat::NAT6_STATIC_MAP_PIN,
                 firewall::FIREWALL_BLOCK_IP4_MAP_PIN,
                 firewall::FIREWALL_BLOCK_IP6_MAP_PIN,
                 flow::FLOW_MATCH_MAP_PIN,
                 dns::DNS_FLOW_SOCKS_PIN,
                 nat::NAT_METRIC_EVENTS_PIN,
+                frag::FRAG4_CACHE_LAN_PIN,
+                frag::FRAG4_CACHE_WAN_PIN,
+                frag::FRAG6_CACHE_LAN_PIN,
+                frag::FRAG6_CACHE_WAN_PIN,
                 firewall::FIREWALL_CONN_METRIC_EVENTS_PIN,
                 route::RT4_LAN_MAP_PIN,
                 route::RT6_LAN_MAP_PIN,
@@ -1104,19 +1112,29 @@ mod tests {
                 assert!(root.join(name).exists(), "missing pin file {name}");
             }
 
-            // Seed a persistent map (nat4 static survives restarts).
-            let nat4 =
-                libbpf_rs::MapHandle::from_pinned_path(&paths.nat4_static_map).expect("open nat4");
-            let key = [1u8; 8];
-            nat4.update(&key, &[2u8; 8], MapFlags::ANY).expect("seed nat4 static");
+            // Seed a persistent map (nat6 static survives restarts).
+            let nat6 =
+                libbpf_rs::MapHandle::from_pinned_path(&paths.nat6_static_map).expect("open nat6");
+            let key = [1u8; 12];
+            nat6.update(&key, &[2u8; 8], MapFlags::ANY).expect("seed nat6 static");
+
+            let frag4 =
+                libbpf_rs::MapHandle::from_pinned_path(&paths.frag4_cache_lan).expect("open frag4");
+            frag4.update(&[3u8; 12], &[4u8; 4], MapFlags::ANY).expect("seed frag4 cache");
 
             // Second "boot": persistent data must survive, per-boot maps reset.
             init_path(&paths);
-            let nat4 =
-                libbpf_rs::MapHandle::from_pinned_path(&paths.nat4_static_map).expect("open nat4");
+            let nat6 =
+                libbpf_rs::MapHandle::from_pinned_path(&paths.nat6_static_map).expect("open nat6");
             assert!(
-                nat4.lookup(&key, MapFlags::ANY).expect("lookup").is_some(),
+                nat6.lookup(&key, MapFlags::ANY).expect("lookup").is_some(),
                 "persistent map data must survive a restart"
+            );
+            let frag4 =
+                libbpf_rs::MapHandle::from_pinned_path(&paths.frag4_cache_lan).expect("open frag4");
+            assert!(
+                frag4.lookup(&[3u8; 12], MapFlags::ANY).expect("lookup").is_none(),
+                "fragment caches must be recreated on every boot"
             );
             let rt4_cache = libbpf_rs::MapHandle::from_pinned_path(&paths.rt4_cache_map)
                 .expect("open rt4_cache");

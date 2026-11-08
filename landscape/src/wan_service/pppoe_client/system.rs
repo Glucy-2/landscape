@@ -2,8 +2,13 @@ use std::net::IpAddr;
 
 use landscape_common::ebpf::DataplaneGuard;
 use landscape_common::net::MacAddr;
-use landscape_common::sys_service::route_service::{LanRouteInfo, LanRouteMode, RouteTargetInfo};
-use landscape_common::wan_service::pppoe::{PppoeDataplane, PppoeEgressTmpl};
+use landscape_common::sys_service::route_service::{
+    LanRouteInfo, LanRouteMode, RouteTargetInfo, WanRouteTarget,
+};
+use landscape_common::wan_service::wan_chain::dataplane::PppoeEgressTmpl;
+use std::sync::Arc;
+
+use landscape_ebpf::chain::wan_link::WanLinkDataplane;
 
 use uuid::Uuid;
 
@@ -22,17 +27,17 @@ pub(crate) struct SessionHandle {
     server_ip: std::net::Ipv4Addr,
     server_mac: Vec<u8>,
     ipv6cp_server_id: Option<Vec<u8>>,
-    ipv6cp_client_linklocal: Option<std::net::Ipv6Addr>,
+    pub(crate) ipv6cp_client_linklocal: Option<std::net::Ipv6Addr>,
     prev_ipv6_linklocal: Option<std::net::Ipv6Addr>,
     iface_name: String,
-    ifindex: u32,
+    connected_at: std::time::Instant,
 }
 
 impl SessionHandle {
     pub(crate) async fn shutdown(
         self,
         route_service: &IpRouteService,
-        dataplane: &dyn PppoeDataplane,
+        dataplane: &Arc<WanLinkDataplane>,
     ) {
         let _ = std::process::Command::new("ip")
             .args([
@@ -78,7 +83,7 @@ impl SessionHandle {
 
         route_service.remove_ipv4_link_route(self.link_id).await;
         route_service.remove_ipv4_lan_route(&self.iface_name).await;
-        dataplane.unbind_wan_ipv4(self.ifindex);
+        dataplane.unbind_wan_ipv4();
 
         let _ = std::process::Command::new("ip")
             .args(["link", "set", "dev", &self.iface_name, "mtu", "1500"])
@@ -88,7 +93,12 @@ impl SessionHandle {
         // the SKB fallback state automatically.
         drop(self._session_guard);
 
-        tracing::info!("PPPoE system state cleaned up for iface={}", self.iface_name);
+        tracing::info!(
+            iface = %self.iface_name,
+            %self.link_id,
+            connected_secs = self.connected_at.elapsed().as_secs(),
+            "PPPoE system state cleaned up"
+        );
     }
 }
 
@@ -97,7 +107,7 @@ pub(crate) async fn create_session(
     lcp: &LcpPhaseResult,
     nego: &NegotiationResult,
     route_service: &IpRouteService,
-    dataplane: &dyn PppoeDataplane,
+    dataplane: &Arc<WanLinkDataplane>,
 ) -> Result<SessionHandle, PppoeError> {
     let mru = lcp.mru.min(config.requested_mru);
     let client_ip = nego.client_ip;
@@ -151,17 +161,17 @@ pub(crate) async fn create_session(
     route_service
         .insert_ipv4_link_route(
             config.link_id,
-            RouteTargetInfo {
-                ifindex: index,
-                weight: 1,
-                mac: Some(iface_mac),
-                is_docker: false,
-                iface_name: iface_name.clone(),
-                iface_ip: IpAddr::V4(client_ip),
-                default_route: config.default_router,
-                gateway_ip: IpAddr::V4(server_ip),
-                dev_only_nexthop: false,
-            },
+            WanRouteTarget::link(
+                config.chain_id,
+                RouteTargetInfo::new_gateway_v4(
+                    index,
+                    iface_name,
+                    Some(iface_mac),
+                    client_ip,
+                    server_ip,
+                    config.default_router,
+                ),
+            ),
         )
         .await;
 
@@ -277,7 +287,7 @@ pub(crate) async fn create_session(
         ..Default::default()
     };
     let session_guard =
-        dataplane.attach_session(index, tmpl, mru).map_err(PppoeError::EbpfInitFailed)?;
+        dataplane.attach_pppoe_session(index, tmpl, mru).map_err(PppoeError::EbpfInitFailed)?;
 
     tracing::info!(
         "native PPPoE eBPF TC enabled for iface={} session_id={}",
@@ -295,7 +305,7 @@ pub(crate) async fn create_session(
         ipv6cp_client_linklocal: client_linklocal_v6,
         prev_ipv6_linklocal: prev_linklocal_v6,
         iface_name: iface_name.clone(),
-        ifindex: index,
+        connected_at: std::time::Instant::now(),
     })
 }
 
@@ -315,25 +325,30 @@ fn setup_linklocal(
             .args(["-6", "addr", "flush", "dev", iface_name, "scope", "link"])
             .output();
 
+        // `replace` (idempotent) + read-back: publish ⟺ the address is
+        // really on the iface — the kernel sources the v6 control plane
+        // from it.
         let result = std::process::Command::new("ip")
-            .args(["-6", "addr", "add", &format!("{}/64", addr), "dev", iface_name])
+            .args(["-6", "addr", "replace", &format!("{}/64", addr), "dev", iface_name])
             .output();
-        match result {
-            Ok(output) if output.status.success() => {
+        if let Ok(output) = &result
+            && !output.status.success()
+        {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!("replace IPv6 link-local {} on {}: {}", addr, iface_name, stderr.trim());
+        }
+        match get_existing_linklocal(iface_name) {
+            Some(current) if current == addr => {
                 tracing::info!(iface = %iface_name, linklocal = %addr, "IPv6 link-local address set from IPv6CP");
                 new = Some(addr);
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            current => {
                 tracing::error!(
-                    "add IPv6 link-local {} on {}: {}",
-                    addr,
-                    iface_name,
-                    stderr.trim()
+                    iface = %iface_name,
+                    expected = %addr,
+                    found = ?current,
+                    "IPv6 link-local missing after replace; session control-plane identity not established"
                 );
-            }
-            Err(e) => {
-                tracing::error!("add IPv6 link-local error: {e:?}");
             }
         }
     }

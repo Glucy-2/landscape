@@ -16,7 +16,8 @@ use landscape_common::metric::dns::{
     DnsSummaryQueryParams, DnsSummaryResponse,
 };
 
-use landscape_common::event::{ConnectMessage, DnsMetricMessage};
+use landscape_common::metric::connect::ConnectMetric;
+use landscape_common::metric::dns::DnsMetricEvent;
 use landscape_common::utils::time::now_ms;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -106,8 +107,8 @@ impl MetricSink for MemoryMetricSink {
 /// Compatibility facade for the pre-pipeline public API.
 #[derive(Clone)]
 pub struct MemoryMetricStore {
-    connect_tx: mpsc::Sender<ConnectMessage>,
-    dns_tx: mpsc::Sender<DnsMetricMessage>,
+    connect_tx: mpsc::Sender<ConnectMetric>,
+    dns_tx: mpsc::Sender<DnsMetricEvent>,
     shutdown: CancellationToken,
     flow_cache: FlowCache,
     iface_realtime: IfaceRealtimeCache,
@@ -142,13 +143,13 @@ impl MemoryMetricStore {
                         let _ = agg::cleanup_flow_cache(&worker_flow, &worker_iface, now, second_window_ms);
                     }
                     msg = connect_rx.recv(), if !connect_closed => match msg {
-                        Some(ConnectMessage::Metric(metric)) => {
+                        Some(metric) => {
                             let _ = agg::process_connect_metric(&worker_flow, &worker_iface, metric, second_window_ms, second_ring_cap);
                         }
                         None => connect_closed = true,
                     },
                     msg = dns_rx.recv(), if !dns_closed => match msg {
-                        Some(DnsMetricMessage::Metric(_)) => {}
+                        Some(_) => {}
                         None => dns_closed = true,
                     },
                 }
@@ -169,11 +170,11 @@ impl MemoryMetricStore {
         }
     }
 
-    pub fn get_connect_msg_channel(&self) -> mpsc::Sender<ConnectMessage> {
+    pub fn get_connect_msg_channel(&self) -> mpsc::Sender<ConnectMetric> {
         self.connect_tx.clone()
     }
 
-    pub fn get_dns_msg_channel(&self) -> mpsc::Sender<DnsMetricMessage> {
+    pub fn get_dns_msg_channel(&self) -> mpsc::Sender<DnsMetricEvent> {
         self.dns_tx.clone()
     }
 
@@ -300,7 +301,7 @@ mod tests {
         let tx = store.get_connect_msg_channel();
         let now = now_ms();
         let (metric, key) = test_metric(now - 1000);
-        tx.send(ConnectMessage::Metric(metric)).await.unwrap();
+        tx.send(metric).await.unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {

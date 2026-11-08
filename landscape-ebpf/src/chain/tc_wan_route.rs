@@ -8,15 +8,9 @@ use crate::bpf_error::LdEbpfResult;
 use crate::landscape::{OwnedOpenObject, TcHookProxy, pin_and_reuse_map};
 use crate::runtime::EbpfRuntime;
 
-mod tc_wan_ingress_intro_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_wan_ingress_intro.skel.rs"));
-}
-use tc_wan_ingress_intro_skel::{TcWanIngressIntroSkel, TcWanIngressIntroSkelBuilder};
+use crate::skel::tc_wan_ingress_intro::{TcWanIngressIntroSkel, TcWanIngressIntroSkelBuilder};
 
-mod tc_wan_egress_route_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_wan_egress_route.skel.rs"));
-}
-use tc_wan_egress_route_skel::{TcWanEgressRouteSkel, TcWanEgressRouteSkelBuilder};
+use crate::skel::tc_wan_egress_route::{TcWanEgressRouteSkel, TcWanEgressRouteSkelBuilder};
 
 pub struct TcWanRouteHandle {
     _intro_skel: TcWanIngressIntroSkel<'static>,
@@ -45,7 +39,6 @@ pub fn init_tc_wan_route(
     xdp_handoff_enabled: bool,
 ) -> LdEbpfResult<TcWanRouteHandle> {
     let paths = &rt.paths;
-    rt.tc.ensure_roots(ifindex, has_eth_header)?;
 
     let l3_offset: u32 = if has_eth_header { 14 } else { 0 };
 
@@ -58,11 +51,10 @@ pub fn init_tc_wan_route(
         &mut open_skel.maps.tc_pipe_root_progs,
         &paths.tc_pipe_root_progs_path(),
     );
-    crate::maps::reuse_pinned_map_or_recreate(
-        &mut open_skel.maps.wan_intro_dispatch_map,
-        &paths.tc_wan_intro_dispatch_path(),
-    );
+    rt.backbone().reuse_wan_trie_map(&mut open_skel.maps.wan_trie_arena)?;
+
     let intro_skel = bpf_ctx!(open_skel.load(), "load per-if tc_wan_ingress_intro")?;
+
     let mut ingress_hook = TcHookProxy::new(
         &intro_skel.progs.tc_wan_ingress_intro,
         ifindex as i32,

@@ -1,5 +1,9 @@
 name: Publish Types to npm
 
+defaults:
+  run:
+    shell: bash
+
 on:
   push:
     branches:
@@ -12,7 +16,7 @@ on:
 
 jobs:
   publish-types:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Checkout code
@@ -29,17 +33,14 @@ jobs:
             openapi-spec-${{ hashFiles('Cargo.lock') }}-
             openapi-spec-
 
-      - name: Install system dependencies
-        if: steps.cache-openapi.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang gcc make pkg-config libelf-dev libclang-dev zlib1g-dev
+      - name: Install build toolchain
+        run: ./scripts/setup_ubuntu_build.sh
 
       - name: Setup Rust
-        if: steps.cache-openapi.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0
+          components: rustfmt, clippy
 
       - name: Generate OpenAPI spec
         if: steps.cache-openapi.outputs.cache-hit != 'true'
@@ -53,7 +54,7 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install dependencies & generate types
+      - name: Install frontend dependencies and generate types
         run: |
           pnpm install --frozen-lockfile
           pnpm --filter @landscape-router/types generate

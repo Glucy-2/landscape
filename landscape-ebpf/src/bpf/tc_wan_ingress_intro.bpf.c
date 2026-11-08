@@ -7,9 +7,7 @@
 
 #include "chain/tc_cb.h"
 #include "chain/tc_handoff.h"
-#include "chain/wan_intro_dispatch.h"
-
-#define TC_INTRO_IFINDEX_TYPE 2
+#include "map/wan_trie.h"
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -22,10 +20,17 @@ struct {
     __uint(value_size, sizeof(u32));
 } tc_pipe_root_progs SEC(".maps");
 
-static __always_inline void tc_intro_dispatch(struct __sk_buff *skb, struct dispatch_key *key) {
-    struct dispatch_value *value = bpf_map_lookup_elem(&wan_intro_dispatch_map, key);
-    if (!value) return;
-    bpf_tail_call(skb, &tc_pipe_root_progs, value->next_pipe_root_index);
+/* WAN dispatch trie shared with the XDP seed (reuse_fd before load).
+ * Dispatch roots are tc_pipe_root_progs slots, indexed by the owning WAN
+ * link's chain id.
+ */
+WAN_TRIE_DECLARE(wan_trie_arena, wan_trie_tbl);
+
+static __always_inline void tc_intro_dispatch(struct __sk_buff *skb, u64 key) {
+    u32 root = wan_trie_resolve(&wan_trie_tbl, key);
+    if (root) {
+        bpf_tail_call(skb, &tc_pipe_root_progs, root);
+    }
 }
 
 SEC("tc/ingress")
@@ -33,41 +38,55 @@ int tc_wan_ingress_intro(struct __sk_buff *skb) {
     int handoff_ret = xdp_handoff_check(skb, false);
     if (handoff_ret != TC_ACT_OK) return handoff_ret;
 
-    struct dispatch_key key = {};
+    u64 key64 = 0;
     bool is_ipv4;
     int ret;
 
     ret = current_pkg_type(skb, current_l3_offset, &is_ipv4);
     if (ret != TC_ACT_OK) return TC_ACT_OK;
 
+    char *data = (char *)(long)skb->data;
+    char *data_end = (char *)(long)skb->data_end;
+
     if (is_ipv4) {
-        struct iphdr *iph;
-        if (VALIDATE_READ_DATA(skb, &iph, current_l3_offset, sizeof(*iph))) return TC_ACT_OK;
+        if ((u64)current_l3_offset + sizeof(struct iphdr) > MAX_OFFSET) return TC_ACT_OK;
+        struct iphdr *iph = (struct iphdr *)(data + current_l3_offset);
+        if ((char *)(iph + 1) > data_end) {
+            __u32 need = current_l3_offset + sizeof(*iph);
+            if (bpf_skb_pull_data(skb, need) != 0) return TC_ACT_OK;
+            data = (char *)(long)skb->data;
+            data_end = (char *)(long)skb->data_end;
+            iph = (struct iphdr *)(data + current_l3_offset);
+            if ((char *)(iph + 1) > data_end) return TC_ACT_OK;
+        }
 
         if (unlikely(is_broadcast_ip4(iph->daddr))) {
             return TC_ACT_OK;
         }
 
-        key.dispatch_type = LANDSCAPE_IPV4_TYPE;
-        key.v4.daddr = iph->daddr;
+        key64 = wan_trie_key_v4(iph->daddr);
     } else {
-        struct ipv6hdr *ip6h;
-        if (VALIDATE_READ_DATA(skb, &ip6h, current_l3_offset, sizeof(*ip6h))) return TC_ACT_OK;
+        if ((u64)current_l3_offset + sizeof(struct ipv6hdr) > MAX_OFFSET) return TC_ACT_OK;
+        struct ipv6hdr *ip6h = (struct ipv6hdr *)(data + current_l3_offset);
+        if ((char *)(ip6h + 1) > data_end) {
+            __u32 need = current_l3_offset + sizeof(*ip6h);
+            if (bpf_skb_pull_data(skb, need) != 0) return TC_ACT_OK;
+            data = (char *)(long)skb->data;
+            data_end = (char *)(long)skb->data_end;
+            ip6h = (struct ipv6hdr *)(data + current_l3_offset);
+            if ((char *)(ip6h + 1) > data_end) return TC_ACT_OK;
+        }
 
         if (unlikely(is_broadcast_ip6(ip6h->daddr.in6_u.u6_addr8))) {
             return TC_ACT_OK;
         }
 
-        key.dispatch_type = LANDSCAPE_IPV6_TYPE;
-        __builtin_memcpy(&key.v6.prefix64, &ip6h->daddr, sizeof(key.v6.prefix64));
+        __builtin_memcpy(&key64, &ip6h->daddr, sizeof(key64));
     }
 
-    tc_intro_dispatch(skb, &key);
-
-    key.v6.prefix64 = 0;
-    key.dispatch_type = TC_INTRO_IFINDEX_TYPE;
-    key.ifindex = skb->ingress_ifindex;
-    tc_intro_dispatch(skb, &key);
+    // The trie is the only dispatch authority: WAN links publish their
+    // v4/v6 (and PPP) keys before this program can see their traffic.
+    tc_intro_dispatch(skb, key64);
 
     return TC_ACT_SHOT;
 }

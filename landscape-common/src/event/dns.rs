@@ -11,11 +11,9 @@ pub enum DnsEvent {
     DynamicRedirectsChanged { flow_id: Option<u32>, source_id: String },
     UpstreamsChanged { upstream_ids: Vec<Uuid> },
     GeoSitesChanged { changed_keys: Option<HashSet<GeoFileCacheKey>> },
-    RuntimeConfigChanged,
-    FlowUpdated,
 }
 
 #[derive(Clone, Debug)]
 pub enum DstIpEvent {
-    GeoIpUpdated,
+    GeoIpUpdated { changed_keys: HashSet<GeoFileCacheKey> },
 }

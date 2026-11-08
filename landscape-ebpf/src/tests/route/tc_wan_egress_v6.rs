@@ -3,16 +3,21 @@
 
 use std::{
     net::{IpAddr, Ipv6Addr},
+    os::fd::{AsFd, AsRawFd},
     str::FromStr,
 };
 
 use landscape_common::{
-    flow::{FlowMarkInfo, ip_mark::IpConfig, ip_mark::IpMarkInfo, mark::FlowMark},
+    flow::{
+        FlowMarkInfo,
+        ip_mark::{IpConfig, IpMarkInfo},
+        mark::{FlowMark, FlowMarkAction, MarkType, SocketMark},
+    },
     net::MacAddr,
-    sys_service::route_service::RouteTargetInfo,
+    sys_service::route_service::{RouteTargetInfo, WanRouteTarget},
 };
 use libbpf_rs::{
-    ProgramInput,
+    MapCore, MapFlags, ProgramInput,
     skel::{OpenSkel, SkelBuilder as _},
 };
 use zerocopy::IntoBytes;
@@ -23,22 +28,18 @@ use crate::{
         route::replace_wan_route_slots_v6_with_map,
     },
     tests::{
-        TestSkb, isolated_pin_root,
-        route::{
-            map_helper::{
-                LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE,
-                WAN_ROUTE_TYPE, create_route6_cache_inner_map, gateway_addr, insert_ip_mac_v6,
-                insert_route6_lan_entry, local_addr, lookup_rt6_cache_value, remote_addr,
-            },
-            packet_builder::simple_ipv6_tcp_syn,
+        TestSkb,
+        helper::map::{
+            LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE,
+            WAN_ROUTE_TYPE, create_route6_cache_inner_map, gateway_addr, insert_ip_mac_v6,
+            insert_route6_lan_entry, local_addr, lookup_rt6_cache_value, normal_mark, remote_addr,
         },
+        isolated_pin_root,
+        pkt::simple_ipv6_tcp_syn,
     },
 };
 
-pub(crate) mod tc_wan_egress_route {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_wan_egress_route.skel.rs"));
-}
-use tc_wan_egress_route::TcWanEgressRouteSkel;
+use crate::skel::tc_wan_egress_route::TcWanEgressRouteSkel;
 
 const RET_OK: i32 = 0;
 const RET_UNSPEC: i32 = -1;
@@ -63,10 +64,19 @@ fn egress_ctx() -> TestSkb {
 macro_rules! load_skel {
     ($pin:expr, $skel:ident) => {
         let pin_root = isolated_pin_root($pin);
-        let mut builder = tc_wan_egress_route::TcWanEgressRouteSkelBuilder::default();
+        let mut builder = crate::skel::tc_wan_egress_route::TcWanEgressRouteSkelBuilder::default();
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = std::mem::MaybeUninit::uninit();
         let $skel = builder.open(&mut open_object).unwrap().load().unwrap();
+    };
+    ($pin:expr, $skel:ident, $l3_offset:expr) => {
+        let pin_root = isolated_pin_root($pin);
+        let mut builder = crate::skel::tc_wan_egress_route::TcWanEgressRouteSkelBuilder::default();
+        builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
+        let mut open_object = std::mem::MaybeUninit::uninit();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        open_skel.maps.rodata_data.as_deref_mut().unwrap().current_l3_offset = $l3_offset;
+        let $skel = open_skel.load().unwrap();
     };
 }
 
@@ -74,7 +84,7 @@ fn run_wan6_egress(
     skel: &TcWanEgressRouteSkel<'_>,
     pkt: &[u8],
     ctx: &mut TestSkb,
-) -> (i32, Vec<u8>, u32, u32) {
+) -> (i32, Vec<u8>, u32, u32, u32) {
     let mut out = vec![0_u8; pkt.len()];
     let mut ctx_out = TestSkb::default();
     let ret = skel
@@ -91,16 +101,22 @@ fn run_wan6_egress(
         .return_value as i32;
     let mark = ctx_out.mark;
     let forwarded = ctx_out.cb[0];
-    (ret, out, mark, forwarded)
+    let chain_id = ctx_out.cb[1] >> 16;
+    (ret, out, mark, forwarded, chain_id)
 }
 
 fn seed_flow_rule(skel: &TcWanEgressRouteSkel<'_>, dst: Ipv6Addr, mark: u32) {
+    seed_flow_rule_under(skel, 0, dst, mark);
+}
+
+/// Seed flow `flow_id`'s ip-trie with a single dst rule.
+fn seed_flow_rule_under(skel: &TcWanEgressRouteSkel<'_>, flow_id: u32, dst: Ipv6Addr, mark: u32) {
     let rules = vec![IpMarkInfo {
-        mark: FlowMark::from(mark),
+        mark: FlowMark::from(mark as u16),
         cidr: IpConfig { ip: IpAddr::V6(dst), prefix: 128 },
         priority: 100,
     }];
-    create_inner_flow_match_map_v6(&skel.maps.flow6_ip_map, 0, &rules).unwrap();
+    create_inner_flow_match_map_v6(&skel.maps.flow6_ip_map, flow_id, &rules).unwrap();
 }
 
 fn seed_wan_slots(
@@ -109,21 +125,13 @@ fn seed_wan_slots(
     ifindex: u32,
     is_docker: bool,
     mac: Option<MacAddr>,
+    chain: u16,
 ) {
-    let targets = [(
-        RouteTargetInfo {
-            weight: 0,
-            ifindex,
-            mac,
-            default_route: false,
-            is_docker,
-            iface_name: "test-wan".to_string(),
-            iface_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            gateway_ip: IpAddr::V6(gateway_addr()),
-            dev_only_nexthop: false,
-        },
-        1,
-    )];
+    let mut info = RouteTargetInfo::dummy(ifindex, "test-wan", IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+    info.mac = mac;
+    info.is_docker = is_docker;
+    info.gateway_ip = IpAddr::V6(gateway_addr());
+    let targets = [(WanRouteTarget::link(chain, info), 1)];
     replace_wan_route_slots_v6_with_map(&skel.maps.rt6_slot_map, flow_id, &targets);
 }
 
@@ -150,10 +158,14 @@ fn wan6_egress_default_flow_without_slot_target_drops() {
     assert_no_route_cache(&skel);
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, _out, mark, forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, _out, mark, forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_SHOT, "default flow without slot target must drop");
-    assert_eq!(mark, 0x0400_0000, "mark must carry FLOW_FROM_WAN source only");
+    assert_eq!(
+        mark,
+        normal_mark(FlowMarkAction::KeepGoing, 0, false),
+        "mark stays a Normal-layout zero mark"
+    );
     assert_eq!(forwarded, 0);
 }
 
@@ -162,15 +174,16 @@ fn wan6_egress_flow_redirect_sets_forwarded_cb() {
     load_skel!("tc-wan6-eg-flow-redirect", skel);
     assert_no_route_cache(&skel);
     seed_flow_rule(&skel, remote_addr(), FLOW_REDIRECT_MARK);
-    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, None);
+    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, None, 11);
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, mark, forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, mark, forwarded, chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_REDIRECT);
     assert_eq!(out, pkt, "no mac rewrite expected for a mac-less slot target");
-    assert_eq!(mark, 0x0400_0305, "mark = flow mark + FLOW_FROM_WAN source");
+    assert_eq!(mark, normal_mark(FlowMarkAction::Redirect, 5, false), "mark = rule flow mark");
     assert_eq!(forwarded, 1, "pick_wan must set the forwarded cb flag");
+    assert_eq!(chain_id, 11, "pick_wan must stash the target chain id in cb");
     assert_no_route_cache(&skel);
 }
 
@@ -181,7 +194,7 @@ fn wan6_egress_flow_drop_shots_with_untouched_mark() {
     seed_flow_rule(&skel, remote_addr(), 0x0200); // action DROP
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, _out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, _out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_SHOT, "FLOW_DROP rule must drop");
     assert_eq!(mark, 0, "drop returns before the mark-source write");
@@ -195,11 +208,15 @@ fn wan6_egress_flow_redirect_without_slot_target_drops() {
     // rt6_slot_map intentionally left empty for flow 5
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, mark, forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, mark, forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_SHOT, "matched flow without slots must drop");
     assert_eq!(out, pkt);
-    assert_eq!(mark, 0x0400_0305, "mark is stamped before pick_wan drops");
+    assert_eq!(
+        mark,
+        normal_mark(FlowMarkAction::Redirect, 5, false),
+        "mark is stamped before pick_wan drops"
+    );
     assert_eq!(forwarded, 0);
 }
 
@@ -208,14 +225,14 @@ fn wan6_egress_slot_with_mac_rewrites_header() {
     load_skel!("tc-wan6-eg-flow-mac", skel);
     seed_flow_rule(&skel, remote_addr(), FLOW_REDIRECT_MARK);
     let target_mac = MacAddr::from_str("02:22:33:44:55:66").unwrap();
-    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, Some(target_mac));
+    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, Some(target_mac), 0);
 
     let gw_mac = MacAddr::from_str("02:55:66:77:88:99").unwrap();
     let gw_dev = MacAddr::from_str("02:aa:bb:cc:dd:f0").unwrap();
     insert_ip_mac_v6(&skel.maps.ip_mac_v6, gateway_addr(), gw_mac, gw_dev, TARGET_IFINDEX);
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, _mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, _mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_REDIRECT);
     assert_eq!(&out[0..6], &gw_mac.octets());
@@ -227,10 +244,10 @@ fn wan6_egress_slot_with_mac_rewrites_header() {
 fn wan6_egress_docker_slot_pushes_vlan_and_redirects() {
     load_skel!("tc-wan6-eg-flow-docker", skel);
     seed_flow_rule(&skel, remote_addr(), FLOW_REDIRECT_MARK);
-    seed_wan_slots(&skel, 5, TARGET_IFINDEX, true, None);
+    seed_wan_slots(&skel, 5, TARGET_IFINDEX, true, None, 0);
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, _mark, forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, _mark, forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_REDIRECT);
     assert_eq!(out, pkt, "vlan push only sets the hwaccel tag under test_run");
@@ -241,13 +258,161 @@ fn wan6_egress_docker_slot_pushes_vlan_and_redirects() {
 fn wan6_egress_same_device_target_tailcalls_into_empty_root_and_shots() {
     load_skel!("tc-wan6-eg-sameif", skel);
     seed_flow_rule(&skel, remote_addr(), FLOW_REDIRECT_MARK);
-    seed_wan_slots(&skel, 5, LOOPBACK_IFINDEX, false, None);
+    seed_wan_slots(&skel, 5, LOOPBACK_IFINDEX, false, None, 0);
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, _mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, _mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_SHOT, "empty root prog array after the tail call → SHOT");
     assert_eq!(out, pkt);
+}
+
+// ---------------------------------------------------------------------------
+// entry (tc_wan_egress_route) dispatch rows
+// ---------------------------------------------------------------------------
+
+/// Runs the entry prog; returns (ret, out, mark, forwarded, chain_id).
+fn run_wan6_egress_entry(
+    skel: &TcWanEgressRouteSkel<'_>,
+    pkt: &[u8],
+    ctx: &mut TestSkb,
+) -> (i32, Vec<u8>, u32, u32, u32) {
+    let mut out = vec![0_u8; pkt.len()];
+    let mut ctx_out = TestSkb::default();
+    let ret = skel
+        .progs
+        .tc_wan_egress_route
+        .test_run(ProgramInput {
+            data_in: Some(pkt),
+            data_out: Some(&mut out),
+            context_in: Some(ctx.as_mut_bytes()),
+            context_out: Some(ctx_out.as_mut_bytes()),
+            ..Default::default()
+        })
+        .expect("run tc_wan_egress_route")
+        .return_value as i32;
+    let mark = ctx_out.mark;
+    let forwarded = ctx_out.cb[0];
+    let chain_id = ctx_out.cb[1] >> 16;
+    (ret, out, mark, forwarded, chain_id)
+}
+
+/// Registers the v6 route worker as the egress root of chain `chain`.
+fn register_v6_root_at_chain(skel: &TcWanEgressRouteSkel<'_>, chain: u32) {
+    let root_fd = skel.progs.tc_route6_wan_egress.as_fd().as_raw_fd();
+    skel.maps
+        .tc_wan_egress_roots
+        .update(&chain.to_ne_bytes(), &root_fd.to_ne_bytes(), MapFlags::ANY)
+        .unwrap();
+}
+
+#[test]
+fn wan6_egress_entry_forwarded_tailcalls_target_chain_root() {
+    // FORWARDED cb + chain id: the entry tail-calls straight into
+    // tc_wan_egress_roots[chain]; the registered root (the v6 worker
+    // itself as a stand-in) completes the routing.
+    load_skel!("tc-wan6-eg-entry-fwd", skel);
+    seed_flow_rule(&skel, remote_addr(), FLOW_REDIRECT_MARK);
+    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, None, 11);
+    register_v6_root_at_chain(&skel, 11);
+
+    let mut ctx = TestSkb {
+        ifindex: LOOPBACK_IFINDEX,
+        cb: [1, 11 << 16, 0, 0, 0],
+        ..Default::default()
+    };
+    let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
+    let (ret, _out, mark, forwarded, chain_id) = run_wan6_egress_entry(&skel, &pkt, &mut ctx);
+
+    assert_eq!(ret, RET_REDIRECT, "entry → chain root → worker redirects");
+    assert_eq!(mark, normal_mark(FlowMarkAction::Redirect, 5, false));
+    assert_eq!(forwarded, 1);
+    assert_eq!(chain_id, 11, "chain id rides the cb untouched");
+}
+
+#[test]
+fn wan6_egress_entry_forwarded_with_empty_chain_shots() {
+    // FORWARDED cb + chain id but no root assembled at that chain: the
+    // tail call misses and the entry drops the packet.
+    load_skel!("tc-wan6-eg-entry-fwd-empty", skel);
+    seed_flow_rule(&skel, remote_addr(), FLOW_REDIRECT_MARK);
+    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, None, 11);
+
+    let mut ctx = TestSkb {
+        ifindex: LOOPBACK_IFINDEX,
+        cb: [1, 11 << 16, 0, 0, 0],
+        ..Default::default()
+    };
+    let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
+    let (ret, _out, _mark, _forwarded, _chain_id) = run_wan6_egress_entry(&skel, &pkt, &mut ctx);
+
+    assert_eq!(ret, RET_SHOT, "empty egress root map → tail call falls through to SHOT");
+}
+
+#[test]
+fn wan6_egress_entry_lan_handoff_skips_verdict_and_honors_lan_flow() {
+    // LAN-originated handoff (ingress_ifindex != 0): the entry
+    // dispatches to the DIRECT_V6 worker, which skips the flow verdict
+    // and hands the LAN-stamped flow id to pick_wan untouched.
+    // Discrimination: flow 5's trie carries a DROP rule — had the
+    // verdict run, the packet would drop — and only the flow-5 slot is
+    // seeded.
+    load_skel!("tc-wan6-eg-entry-handoff", skel);
+    seed_flow_rule_under(&skel, 5, remote_addr(), 0x0200); // action DROP
+    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, None, 11);
+
+    let mut ctx = TestSkb {
+        ifindex: LOOPBACK_IFINDEX,
+        ingress_ifindex: 7,
+        mark: FLOW_REDIRECT_MARK, // LAN side already chose flow 5
+        ..Default::default()
+    };
+    let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
+    let (ret, _out, mark, forwarded, chain_id) = run_wan6_egress_entry(&skel, &pkt, &mut ctx);
+
+    assert_eq!(ret, RET_REDIRECT, "preserved LAN flow id routes via its slot");
+    assert_eq!(mark, FLOW_REDIRECT_MARK, "the direct worker never rewrites the mark");
+    assert_eq!(forwarded, 1, "pick_wan sets the forwarded flag");
+    assert_eq!(chain_id, 11, "flow-5 slot target chain rides the cb");
+}
+
+#[test]
+fn wan6_egress_entry_lan_handoff_without_flow_id_uses_default_slots() {
+    // LAN matched no flow rule: the mark carries no flow id and pick_wan
+    // falls back to the flow-0 default slots.
+    load_skel!("tc-wan6-eg-entry-handoff-default", skel);
+    seed_wan_slots(&skel, 0, TARGET_IFINDEX, false, None, 11);
+
+    let mut ctx = TestSkb {
+        ifindex: LOOPBACK_IFINDEX,
+        ingress_ifindex: 7,
+        ..Default::default()
+    };
+    let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
+    let (ret, _out, mark, forwarded, chain_id) = run_wan6_egress_entry(&skel, &pkt, &mut ctx);
+
+    assert_eq!(ret, RET_REDIRECT, "flow-0 default slot routes the handoff");
+    assert_eq!(mark, 0, "the direct worker never rewrites the mark");
+    assert_eq!(forwarded, 1);
+    assert_eq!(chain_id, 11);
+}
+
+#[test]
+fn wan6_egress_entry_local_traffic_runs_verdict() {
+    // Locally generated (ingress_ifindex == 0): the normal worker runs
+    // the verdict (flow-0 trie rule redirects to flow 5's slot).
+    load_skel!("tc-wan6-eg-entry-local", skel);
+    seed_flow_rule(&skel, remote_addr(), FLOW_REDIRECT_MARK);
+    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, None, 11);
+
+    let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
+    let (ret, _out, mark, forwarded, chain_id) =
+        run_wan6_egress_entry(&skel, &pkt, &mut egress_ctx());
+
+    assert_eq!(ret, RET_REDIRECT);
+    assert_eq!(mark, normal_mark(FlowMarkAction::Redirect, 5, false));
+    assert_eq!(forwarded, 1);
+    assert_eq!(chain_id, 11);
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +435,7 @@ fn wan6_egress_lan_entry_other_iface_redirects_before_verdict() {
     );
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, _out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, _out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_REDIRECT, "mac-less LAN entry on another iface plain-redirects");
     assert_eq!(mark, 0, "returned before the mark-source write");
@@ -292,7 +457,7 @@ fn wan6_egress_lan_entry_own_addr_hands_to_stack() {
     );
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, _out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, _out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_UNSPEC, "LAN-typed entry for the target address itself");
     assert_eq!(mark, 0);
@@ -315,10 +480,10 @@ fn wan6_egress_wan_typed_entry_falls_through_to_pick_wan() {
     );
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, _out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, _out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_SHOT);
-    assert_eq!(mark, 0x0400_0000, "mark must carry the WAN source bits");
+    assert_eq!(mark, normal_mark(FlowMarkAction::KeepGoing, 0, false), "mark keeps the zero mark");
 }
 
 #[test]
@@ -338,7 +503,7 @@ fn wan6_egress_lan_entry_same_iface_hands_to_stack() {
     );
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_UNSPEC, "entry pointing at the egress device itself");
     assert_eq!(out, pkt);
@@ -370,7 +535,7 @@ fn wan6_egress_lan_entry_nexthop_resolves_gateway_mac() {
     );
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_REDIRECT);
     assert_eq!(&out[0..6], &gw_mac.octets());
@@ -397,7 +562,7 @@ fn wan6_egress_lan_entry_with_mac_rewrites_header() {
     insert_ip_mac_v6(&skel.maps.ip_mac_v6, remote_addr(), host_mac, dev_mac, TARGET_IFINDEX);
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_REDIRECT);
     assert_eq!(&out[0..6], &host_mac.octets(), "dst = ip_mac[daddr].mac");
@@ -424,7 +589,7 @@ fn wan6_egress_lan_entry_with_mac_without_ip_mac_falls_to_neigh() {
     // no ip_mac_v6 entry for daddr
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_REDIRECT, "neigh fallback still redirects");
     assert_eq!(out, pkt, "no rewrite happened");
@@ -436,7 +601,7 @@ fn wan6_egress_multicast_dst_hands_to_stack() {
     // v6-specific: multicast and link-local targets pass through F3.
     load_skel!("tc-wan6-eg-mcast", skel);
     let pkt = simple_ipv6_tcp_syn(local_addr(), Ipv6Addr::from_str("ff02::1").unwrap());
-    let (ret, _out, _mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, _out, _mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
     assert_eq!(ret, RET_UNSPEC);
 }
 
@@ -446,7 +611,7 @@ fn wan6_egress_link_local_dst_hands_to_stack() {
     // row above only covers ff00::/8).
     load_skel!("tc-wan6-eg-linklocal", skel);
     let pkt = simple_ipv6_tcp_syn(local_addr(), Ipv6Addr::from_str("fe80::1").unwrap());
-    let (ret, out, _mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, _mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
     assert_eq!(ret, RET_UNSPEC);
     assert_eq!(out, pkt);
 }
@@ -461,12 +626,12 @@ fn wan6_egress_flow_direct_resets_flow_id_to_default() {
     // *incoming* flow id (5 via ctx.mark) but pick_wan uses flow 0's slots.
     load_skel!("tc-wan6-eg-flow-direct", skel);
     let rules = vec![IpMarkInfo {
-        mark: FlowMark::from(FLOW_DIRECT_MARK),
+        mark: FlowMark::from(FLOW_DIRECT_MARK as u16),
         cidr: IpConfig { ip: IpAddr::V6(remote_addr()), prefix: 128 },
         priority: 100,
     }];
     create_inner_flow_match_map_v6(&skel.maps.flow6_ip_map, 5, &rules).unwrap();
-    seed_wan_slots(&skel, 0, TARGET_IFINDEX, false, None);
+    seed_wan_slots(&skel, 0, TARGET_IFINDEX, false, None, 0);
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
     let mut ctx = TestSkb {
@@ -475,10 +640,10 @@ fn wan6_egress_flow_direct_resets_flow_id_to_default() {
         mark: 5, // incoming flow id from an earlier stage
         ..Default::default()
     };
-    let (ret, _out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut ctx);
+    let (ret, _out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut ctx);
 
     assert_eq!(ret, RET_REDIRECT);
-    assert_eq!(mark, 0x0400_0100, "source WAN + DIRECT mark with reset id");
+    assert_eq!(mark, normal_mark(FlowMarkAction::Direct, 0, false), "DIRECT mark with reset id");
 }
 
 #[test]
@@ -497,36 +662,37 @@ fn wan6_egress_dns_rule_redirects_when_no_ip_rule() {
             priority: 100,
         }],
     );
-    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, None);
+    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, None, 0);
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, _out, mark, forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, _out, mark, forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_REDIRECT, "dns-only rule must drive the redirect");
-    assert_eq!(mark, 0x0400_0305);
+    assert_eq!(mark, normal_mark(FlowMarkAction::Redirect, 5, false));
     assert_eq!(forwarded, 1);
 }
 
 #[test]
-fn wan6_egress_incoming_mark_source_replaced_by_wan() {
-    // A mark arriving with LAN source bits must be re-stamped with
-    // FLOW_FROM_WAN after the verdict.
-    load_skel!("tc-wan6-eg-flow-markseed", skel);
+fn wan6_egress_preserves_mark_type_tag() {
+    // A host-direct tagged mark (MARK_TYPE_HOST_DIRECT tag, chain id in the
+    // low 16 bits) must pass the egress verdict untouched: with no rule
+    // matching, the verdict keeps the input mark and the tag bit survives.
+    load_skel!("tc-wan6-eg-flow-tagkeep", skel);
     assert_no_route_cache(&skel);
-    seed_flow_rule(&skel, remote_addr(), FLOW_REDIRECT_MARK);
-    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, None);
 
+    let tag_mark = u32::from(SocketMark::new(MarkType::HostDirect { chain_id: 0x1234 }, 0));
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
     let mut ctx = TestSkb {
         ifindex: LOOPBACK_IFINDEX,
         ingress_ifindex: 0,
-        mark: 0x0200_0000, // FLOW_FROM_LAN source, default flow id
+        mark: tag_mark,
         ..Default::default()
     };
-    let (ret, _out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut ctx);
+    let (ret, _out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut ctx);
 
-    assert_eq!(ret, RET_REDIRECT);
-    assert_eq!(mark, 0x0400_0305, "the LAN source bits must be replaced by FLOW_FROM_WAN");
+    // verdict resolves flow id 0x1234 & 0xFF = 0x34, no slot seeded → drop
+    assert_eq!(ret, RET_SHOT);
+    assert_eq!(mark, tag_mark, "the mark-type tag must pass egress unchanged");
 }
 
 // ---------------------------------------------------------------------------
@@ -540,15 +706,15 @@ fn wan6_egress_slot_with_mac_gateway_miss_falls_to_neigh() {
     load_skel!("tc-wan6-eg-flow-gwmiss", skel);
     seed_flow_rule(&skel, remote_addr(), FLOW_REDIRECT_MARK);
     let target_mac = MacAddr::from_str("02:22:33:44:55:66").unwrap();
-    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, Some(target_mac));
+    seed_wan_slots(&skel, 5, TARGET_IFINDEX, false, Some(target_mac), 0);
     // no ip_mac_v6 entry for the slot gate address
 
     let pkt = simple_ipv6_tcp_syn(local_addr(), remote_addr());
-    let (ret, out, mark, forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, mark, forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_REDIRECT, "neigh fallback still redirects");
     assert_eq!(out, pkt, "no rewrite happened");
-    assert_eq!(mark, 0x0400_0305);
+    assert_eq!(mark, normal_mark(FlowMarkAction::Redirect, 5, false));
     assert_eq!(forwarded, 1, "the cb flag is stamped before the neigh fallback");
 }
 
@@ -558,14 +724,15 @@ fn wan6_egress_slot_with_mac_gateway_miss_falls_to_neigh() {
 
 #[test]
 fn wan6_egress_truncated_ip6_header_passes_to_stack() {
-    // read_context truncation row (v6): ethertype claims IPv6 but the ip6
-    // header is cut short → SHOT from read_context, mapped to "pass".
-    load_skel!("tc-wan6-eg-runt", skel);
-    let mut pkt = vec![0xff_u8; 14 + 20]; // eth + partial ip6 header
+    // read_context truncation row (v6): the rodata l3 offset overruns the L3
+    // header read → SHOT, mapped to "pass" (PROG_TEST_RUN rejects short
+    // frames).
+    load_skel!("tc-wan6-eg-runt", skel, 15);
+    let mut pkt = vec![0xff_u8; 14 + 40]; // eth + full-size "ip6" payload
     pkt[12] = 0x86;
     pkt[13] = 0xdd;
 
-    let (ret, out, mark, _forwarded) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
+    let (ret, out, mark, _forwarded, _chain_id) = run_wan6_egress(&skel, &pkt, &mut egress_ctx());
 
     assert_eq!(ret, RET_OK, "truncated ip6 header must pass, not drop");
     assert_eq!(out, pkt);

@@ -2,8 +2,7 @@
 #define __LD_LANDSCAPE_H__
 #include <vmlinux.h>
 #include <bpf/bpf_endian.h>
-#include "base/landscape_log.h"
-#include "einat/einat_types.h"
+#include "base/printk.h"
 #include "base/mark.h"
 #include "base/tproxy.h"
 
@@ -34,8 +33,8 @@
 #define LANDSCAPE_IPV6_TYPE 1
 
 #define PRINT_MAC_ADDR(mac)                                                                        \
-    ld_bpf_log("mac: %02x:%02x:%02x:%02x:%02x:%02x", (mac)[0], (mac)[1], (mac)[2], (mac)[3],       \
-               (mac)[4], (mac)[5])
+    ld_log("mac: %02x:%02x:%02x:%02x:%02x:%02x", (mac)[0], (mac)[1], (mac)[2], (mac)[3], (mac)[4], \
+           (mac)[5])
 
 #ifndef likely
 #define likely(x) __builtin_expect(!!(x), 1)
@@ -46,32 +45,6 @@
 #endif
 
 #define MAX_OFFSET 20480
-
-static __always_inline int _validate_read(struct __sk_buff *skb, void **hdr_, u32 offset, u32 len) {
-    if (unlikely(offset > MAX_OFFSET || len > 256 || offset + len > MAX_OFFSET)) return 1;
-
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
-    void *hdr = data + offset;
-
-    barrier_var(hdr);
-    if (likely(hdr + len <= data_end)) {
-        *hdr_ = hdr;
-        return 0;
-    }
-
-    if (bpf_skb_pull_data(skb, offset + len)) return 1;
-
-    data = (void *)(long)skb->data;
-    hdr = data + offset;
-
-    if (hdr + len > (void *)(long)skb->data_end) return 1;
-
-    *hdr_ = hdr;
-    return 0;
-}
-
-#define VALIDATE_READ_DATA(skb, hdr, off, len) (_validate_read(skb, (void **)hdr, off, len))
 
 struct ipv4_lpm_key {
     __u32 prefixlen;
@@ -135,17 +108,9 @@ static int store_mac_v6(struct __sk_buff *skb, u8 *dst_mac, u8 *src_mac) {
     return 0;
 }
 
-// only for ipv6
-union u_inet6_addr {
-    __be32 all[4];
-    __be32 ip;
-    __be32 ip6[4];
-    u8 bytes[16];
-};
-
 struct inet_pair {
-    union u_inet_addr src_addr;
-    union u_inet_addr dst_addr;
+    struct in6_addr src_addr;
+    struct in6_addr dst_addr;
     __be16 src_port;
     __be16 dst_port;
 };
@@ -155,11 +120,12 @@ static __always_inline bool is_zero_mac(const u8 *mac) {
 }
 
 static __always_inline int is_broadcast_mac(struct __sk_buff *skb) {
-    u8 *mac;
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    barrier_var(data);
+    if (data + 6 > data_end) return TC_ACT_UNSPEC;
 
-    if (VALIDATE_READ_DATA(skb, &mac, 0, 6)) {
-        return TC_ACT_UNSPEC;
-    }
+    u8 *mac = (u8 *)data;
 
     // 判断是否是广播地址 ff:ff:ff:ff:ff:ff
     bool is_broadcast = mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff && mac[3] == 0xff &&
@@ -215,7 +181,8 @@ static __always_inline bool is_broadcast_ip6(const u8 *bytes) {
 }
 
 static __always_inline bool is_broadcast_ip6_pair(const struct inet_pair *ip_pair) {
-    return is_broadcast_ip6(ip_pair->src_addr.bits) || is_broadcast_ip6(ip_pair->dst_addr.bits);
+    return is_broadcast_ip6(ip_pair->src_addr.in6_u.u6_addr8) ||
+           is_broadcast_ip6(ip_pair->dst_addr.in6_u.u6_addr8);
 }
 
 struct inet4_addr {
@@ -229,11 +196,9 @@ struct inet4_pair {
     __be16 dst_port;
 };
 
-typedef union u_inet6_addr inet6_addr;
-
 struct inet6_pair {
-    inet6_addr src_addr;
-    inet6_addr dst_addr;
+    struct in6_addr src_addr;
+    struct in6_addr dst_addr;
     __be16 src_port;
     __be16 dst_port;
 };
@@ -243,44 +208,57 @@ static __always_inline bool inet4_addr_equal(const struct inet4_addr *a,
     return a->addr == b->addr;
 }
 
-static __always_inline bool inet6_addr_equal(const inet6_addr *a, const inet6_addr *b) {
-    return a->all[0] == b->all[0] && a->all[1] == b->all[1] && a->all[2] == b->all[2] &&
-           a->all[3] == b->all[3];
+static __always_inline bool inet6_addr_equal(const struct in6_addr *a, const struct in6_addr *b) {
+    return a->in6_u.u6_addr32[0] == b->in6_u.u6_addr32[0] &&
+           a->in6_u.u6_addr32[1] == b->in6_u.u6_addr32[1] &&
+           a->in6_u.u6_addr32[2] == b->in6_u.u6_addr32[2] &&
+           a->in6_u.u6_addr32[3] == b->in6_u.u6_addr32[3];
 }
 
-static __always_inline bool ip_addr_is_zero(const union u_inet_addr *a) {
-    return a->all[0] == 0 && a->all[1] == 0 && a->all[2] == 0 && a->all[3] == 0;
+static __always_inline bool ip_addr_is_zero(const struct in6_addr *a) {
+    return a->in6_u.u6_addr32[0] == 0 && a->in6_u.u6_addr32[1] == 0 && a->in6_u.u6_addr32[2] == 0 &&
+           a->in6_u.u6_addr32[3] == 0;
 }
 
-static __always_inline bool ip_addr_is_zero_in6(const inet6_addr *a) {
-    return a->all[0] == 0 && a->all[1] == 0 && a->all[2] == 0 && a->all[3] == 0;
+static __always_inline bool ip_addr_is_zero_in6(const struct in6_addr *a) {
+    return a->in6_u.u6_addr32[0] == 0 && a->in6_u.u6_addr32[1] == 0 && a->in6_u.u6_addr32[2] == 0 &&
+           a->in6_u.u6_addr32[3] == 0;
 }
 
-static __always_inline bool ip_addr_equal(const union u_inet_addr *a, const union u_inet_addr *b) {
-    return a->all[0] == b->all[0] && a->all[1] == b->all[1] && a->all[2] == b->all[2] &&
-           a->all[3] == b->all[3];
+static __always_inline bool ip_addr_equal(const struct in6_addr *a, const struct in6_addr *b) {
+    return a->in6_u.u6_addr32[0] == b->in6_u.u6_addr32[0] &&
+           a->in6_u.u6_addr32[1] == b->in6_u.u6_addr32[1] &&
+           a->in6_u.u6_addr32[2] == b->in6_u.u6_addr32[2] &&
+           a->in6_u.u6_addr32[3] == b->in6_u.u6_addr32[3];
 }
 
-static __always_inline bool ip_addr_equal_in6(const inet6_addr *a, const inet6_addr *b) {
-    return a->all[0] == b->all[0] && a->all[1] == b->all[1] && a->all[2] == b->all[2] &&
-           a->all[3] == b->all[3];
+static __always_inline bool ip_addr_equal_in6(const struct in6_addr *a, const struct in6_addr *b) {
+    return a->in6_u.u6_addr32[0] == b->in6_u.u6_addr32[0] &&
+           a->in6_u.u6_addr32[1] == b->in6_u.u6_addr32[1] &&
+           a->in6_u.u6_addr32[2] == b->in6_u.u6_addr32[2] &&
+           a->in6_u.u6_addr32[3] == b->in6_u.u6_addr32[3];
 }
 
-static __always_inline bool ip_addr_equal_x(const union u_inet_addr *a, const inet6_addr *b) {
-    return a->all[0] == b->all[0] && a->all[1] == b->all[1] && a->all[2] == b->all[2] &&
-           a->all[3] == b->all[3];
+static __always_inline bool ip_addr_equal_x(const struct in6_addr *a, const struct in6_addr *b) {
+    return a->in6_u.u6_addr32[0] == b->in6_u.u6_addr32[0] &&
+           a->in6_u.u6_addr32[1] == b->in6_u.u6_addr32[1] &&
+           a->in6_u.u6_addr32[2] == b->in6_u.u6_addr32[2] &&
+           a->in6_u.u6_addr32[3] == b->in6_u.u6_addr32[3];
 }
 
 #define COPY_ADDR_FROM(t, s) (__builtin_memcpy((t), (s), sizeof(t)))
 
 static __always_inline int current_l3_protocol(struct __sk_buff *skb, u32 current_l3_offset,
                                                u8 *l3_protocol) {
-    if (current_l3_offset != 0) {
-        struct ethhdr *eth;
-        if (VALIDATE_READ_DATA(skb, &eth, 0, sizeof(*eth))) {
-            return TC_ACT_SHOT;
-        }
+    u32 need = current_l3_offset != 0 ? sizeof(struct ethhdr) : 1;
 
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    barrier_var(data);
+    if (data + need > data_end) return TC_ACT_SHOT;
+
+    if (current_l3_offset != 0) {
+        struct ethhdr *eth = (struct ethhdr *)data;
         if (eth->h_proto == ETH_IPV4) {
             *l3_protocol = LANDSCAPE_IPV4_TYPE;
         } else if (eth->h_proto == ETH_IPV6) {
@@ -289,11 +267,7 @@ static __always_inline int current_l3_protocol(struct __sk_buff *skb, u32 curren
             return TC_ACT_UNSPEC;
         }
     } else {
-        u8 *p_version;
-        if (VALIDATE_READ_DATA(skb, &p_version, 0, sizeof(*p_version))) {
-            return TC_ACT_SHOT;
-        }
-        u8 ip_version = (*p_version) >> 4;
+        u8 ip_version = (*(u8 *)data) >> 4;
         if (ip_version == 4) {
             *l3_protocol = LANDSCAPE_IPV4_TYPE;
         } else if (ip_version == 6) {

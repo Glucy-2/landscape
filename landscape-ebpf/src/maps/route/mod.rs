@@ -26,26 +26,16 @@ mod tests {
     use landscape_common::{
         flow::mark::FlowMark,
         flow::trace::{FlowMatchSource, FlowRuleMatchResult, FlowVerdictSource},
-        sys_service::route_service::RouteTargetInfo,
+        sys_service::route_service::{RouteTargetInfo, WanRouteTarget},
     };
     use libbpf_rs::{MapCore, MapFlags, MapHandle, MapType, libbpf_sys};
-    use zerocopy::IntoBytes;
+    use zerocopy::{FromBytes, IntoBytes};
 
     use super::types::{Route6SlotKey, Route6TargetInfo};
     use super::*;
 
-    fn dummy_v6_route_target(ifindex: u32) -> RouteTargetInfo {
-        RouteTargetInfo {
-            weight: 0,
-            ifindex,
-            mac: None,
-            default_route: false,
-            is_docker: false,
-            iface_name: String::new(),
-            iface_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            gateway_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            dev_only_nexthop: false,
-        }
+    fn dummy_v6(ifindex: u32) -> RouteTargetInfo {
+        RouteTargetInfo::dummy(ifindex, "", IpAddr::V6(Ipv6Addr::UNSPECIFIED))
     }
 
     fn create_test_slot_map_v6() -> MapHandle {
@@ -97,12 +87,33 @@ mod tests {
         assert!(lookup_v6_slot(&map, 5, 1));
 
         // Call replace with all-zero weights
-        let zero_weight_target = (dummy_v6_route_target(11), 0);
+        let zero_weight_target = (WanRouteTarget::link(0, dummy_v6(11)), 0);
         replace_wan_route_slots_v6_with_map(&map, 5, &[zero_weight_target]);
 
         // Slots should be cleared
         assert!(!lookup_v6_slot(&map, 5, 0));
         assert!(!lookup_v6_slot(&map, 5, 1));
+    }
+
+    #[test]
+    fn replace_slots_store_chain_in_values() {
+        let map = create_test_slot_map_v6();
+
+        let target = (WanRouteTarget::link(7, dummy_v6(11)), 3);
+        replace_wan_route_slots_v6_with_map(&map, 5, &[target]);
+
+        // Every slot of flow 5 carries the target's chain for the WAN
+        // egress chain dispatch.
+        for slot in 0..16u32 {
+            let key = Route6SlotKey { flow_id: 5, slot };
+            let bytes = map
+                .lookup(key.as_bytes(), MapFlags::ANY)
+                .expect("lookup slot")
+                .expect("slot filled");
+            let value = Route6TargetInfo::read_from_bytes(&bytes).expect("decode slot value");
+            assert_eq!(value.ifindex, 11);
+            assert_eq!(value.link_chain_id, 7);
+        }
     }
 
     #[test]

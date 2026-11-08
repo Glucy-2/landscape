@@ -8,7 +8,7 @@ use landscape_common::docker::DockerTargetEnroll;
 use landscape_common::docker::error::DockerError;
 use landscape_common::{
     service::ServiceStatus,
-    sys_service::route_service::{RouteOwner, RouteTargetInfo},
+    sys_service::route_service::{RouteOwner, RouteTargetInfo, WanRouteTarget},
 };
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -444,11 +444,11 @@ pub async fn accept_docker_info(
             }
             tracing::info!("container_name: {container_name:?}");
 
-            let (ipv4, ipv6) = RouteTargetInfo::docker_new(ifindex, &container_name);
+            let (ipv4, ipv6) = RouteTargetInfo::new_docker(ifindex, &container_name);
             let owner = RouteOwner::Netns(container_name);
 
-            ip_route_service.insert_ipv4_wan_route(&owner, ipv4).await;
-            ip_route_service.insert_ipv6_wan_route(&owner, ipv6).await;
+            ip_route_service.insert_ipv4_wan_route(&owner, WanRouteTarget::netns(ipv4)).await;
+            ip_route_service.insert_ipv6_wan_route(&owner, WanRouteTarget::netns(ipv6)).await;
             ip_route_service.print_wan_ifaces().await;
         }
         Ok(Err(e)) => {

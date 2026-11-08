@@ -1,11 +1,15 @@
-name: build and release
+name: Build and Release
+
+defaults:
+  run:
+    shell: bash
 
 on:
   push:
     tags:
       - '*'
     branches:
-      - 'build'
+      - 'build-all'
 
 env:
   sccache_version: 'v0.12.0'
@@ -17,14 +21,14 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: ubuntu-22.04
+          - host: ubuntu-24.04
             architecture: x86_64
             target: x86_64-unknown-linux-gnu
             toolchain: 1.98.0
             bindgen: false
             gateway: true
 
-          - host: ubuntu-22.04-arm
+          - host: ubuntu-24.04-arm
             architecture: aarch64
             target: aarch64-unknown-linux-gnu
             toolchain: 1.98.0
@@ -35,31 +39,40 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang gcc make pkg-config libelf-dev libclang-dev zlib1g-dev
+      - name: Install build toolchain
+        run: ./scripts/setup_ubuntu_build.sh
+
+      - name: Configure sccache
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', process.env.ACTIONS_CACHE_SERVICE_V2 || 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Setup sccache
         run: |
           sccache_arch=${{ matrix.settings.architecture }}
           wget -qO- https://github.com/mozilla/sccache/releases/download/${sccache_version}/sccache-${sccache_version}-${sccache_arch}-unknown-linux-musl.tar.gz | sudo tar -xzf - -C /usr/local/bin/ --strip-components=1
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          echo "SCCACHE_GHA_ENABLED=on" >> $GITHUB_ENV
 
-      - name: Setup rust
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.settings.toolchain }}
           targets: ${{ matrix.settings.target }}
-          components: rustfmt
+          components: rustfmt, clippy
 
-      - name: Setup cache
+      - name: Cache cargo registry
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cache/sccache
-          key: ${{ runner.os }}-${{ matrix.settings.target }}-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-${{ matrix.settings.target }}-
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Build binaries
         run: |
@@ -93,6 +106,10 @@ jobs:
           name: landscape-webserver-${{ matrix.settings.target }}
           path: output/*
 
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   # 交叉编译（cargo-zigbuild + 发行版 sysroot，见 scripts/build_musl_static.sh
   # 与 scripts/build_gnu.sh）：
   #   - musl 目标：全静态单文件，无 so 依赖，产物 landscape-webserver-<arch>-static
@@ -112,8 +129,8 @@ jobs:
   #     (riscv64/s390x) and Debian sid (loong64), replacing the previous gcc
   #     cross toolchains and from-source zlib/elfutils builds
   linux-cross-build:
-    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/build'
-    runs-on: ubuntu-26.04
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/build-all'
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -152,42 +169,60 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang curl gcc make pkg-config python3-pip wget file libelf-dev zlib1g-dev libclang-dev
+      - name: Install build toolchain
+        run: ./scripts/setup_ubuntu_build.sh
+
+      - name: Configure sccache
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', process.env.ACTIONS_CACHE_SERVICE_V2 || 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Setup sccache
         run: |
           wget -qO- https://github.com/mozilla/sccache/releases/download/${sccache_version}/sccache-${sccache_version}-x86_64-unknown-linux-musl.tar.gz | sudo tar -xzf - -C /usr/local/bin/ --strip-components=1
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          echo "SCCACHE_GHA_ENABLED=on" >> $GITHUB_ENV
 
-      - name: Setup rust
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0
           targets: ${{ matrix.settings.target }}
+          components: rustfmt, clippy
 
-      - name: Setup cache
+      - name: Cache cargo registry
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cache/sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Setup sysroots cache
+        uses: actions/cache@v5
+        with:
+          path: |
             ~/sysroots
           key: ${{ runner.os }}-cross-${{ matrix.settings.target }}-${{ github.sha }}
           restore-keys: ${{ runner.os }}-cross-${{ matrix.settings.target }}-
 
       - name: Setup zig and cargo-zigbuild
         run: |
-          sudo pip3 install --break-system-packages ziglang==0.16.0
+          python3 -m pip install --user --break-system-packages ziglang==0.16.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           cargo install --locked cargo-zigbuild --version 0.23.4
 
       - name: Build binaries
         run: |
-          SCRIPT=build_gnu.sh
-          if [[ "${{ matrix.settings.target }}" == *-musl ]]; then
-            SCRIPT=build_musl_static.sh
-          fi
+          case "${{ matrix.settings.target }}" in
+            *-musl) SCRIPT=build_musl_static.sh ;;
+            *) SCRIPT=build_gnu.sh ;;
+          esac
           GATEWAY=${{ matrix.settings.gateway }} ./scripts/$SCRIPT ${{ matrix.settings.target }}
 
       - name: Verify static linking
@@ -204,9 +239,14 @@ jobs:
         with:
           name: landscape-webserver-${{ matrix.settings.target }}${{ contains(matrix.settings.target, 'musl') && '-static' || '' }}
           path: output/*
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   build-front:
     needs: linux-build
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout code
@@ -259,8 +299,8 @@ jobs:
           path: output/static.zip
 
   # Debian packages from the native glibc builds. Runs on the same runner
-  # image as linux-build (22.04 keeps the glibc requirement low) and on the
-  # package's architecture so dpkg-shlibdeps can resolve the libraries.
+  # image as linux-build and on the package's architecture so
+  # dpkg-shlibdeps can resolve the libraries.
   package-deb:
     needs: [linux-build, build-front]
     runs-on: ${{ matrix.settings.host }}
@@ -268,11 +308,11 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: ubuntu-22.04
+          - host: ubuntu-24.04
             architecture: x86_64
             target: x86_64-unknown-linux-gnu
 
-          - host: ubuntu-22.04-arm
+          - host: ubuntu-24.04-arm
             architecture: aarch64
             target: aarch64-unknown-linux-gnu
 
@@ -283,7 +323,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg-dev binutils unzip libelf1 zlib1g
+          sudo apt-get install -y dpkg-dev binutils unzip libelf1t64 zlib1g
 
       - name: Download binary
         uses: actions/download-artifact@v8
@@ -319,7 +359,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     needs: [linux-build, linux-cross-build, build-front, package-deb]
 
     steps:
@@ -344,7 +384,7 @@ jobs:
           cd output
           sha256sum * > SHASUM256sum.txt
 
-      - name: Create GitHub Release
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
           name: Release ${{ github.ref_name }}

@@ -2,17 +2,12 @@ use std::sync::Arc;
 
 use crate::bpf_ctx;
 use crate::bpf_error::LdEbpfResult;
-use crate::runtime::EbpfRuntime;
-
-pub(crate) mod xdp_pppoe_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/xdp_pppoe.skel.rs"));
-}
+use crate::chain::wan_link::WanLinkDataplane;
 
 pub struct XdpPppoeHandle {
-    runtime: Arc<EbpfRuntime>,
-    _skel: xdp_pppoe_skel::XdpPppoeSkel<'static>,
+    dp: Arc<WanLinkDataplane>,
+    _skel: crate::skel::xdp_pppoe::XdpPppoeSkel<'static>,
     _backing: crate::landscape::OwnedOpenObject,
-    ifindex: u32,
 }
 
 unsafe impl Send for XdpPppoeHandle {}
@@ -20,24 +15,22 @@ unsafe impl Sync for XdpPppoeHandle {}
 
 impl Drop for XdpPppoeHandle {
     fn drop(&mut self) {
-        use crate::chain::xdp_manager::StageType;
-        let _ = self.runtime.xdp.remove(self.ifindex, StageType::Pppoe);
+        use crate::chain::stage::{FromLanStageType, StageFamily};
+        for family in StageFamily::ALL {
+            self.dp.xdp().remove_from_lan(FromLanStageType::Pppoe, family);
+        }
     }
 }
 
-pub fn init_xdp_pppoe(
-    rt: &Arc<EbpfRuntime>,
-    ifindex: u32,
-    session_id: u16,
-) -> LdEbpfResult<XdpPppoeHandle> {
-    use crate::chain::xdp_manager::StageType;
+pub fn init_xdp_pppoe(dp: &Arc<WanLinkDataplane>, session_id: u16) -> LdEbpfResult<XdpPppoeHandle> {
+    use crate::chain::stage::{FamilyProg, FromLanStageType, StageFamily};
     use crate::landscape::{OwnedOpenObject, pin_and_reuse_map};
     use libbpf_rs::skel::{OpenSkel, SkelBuilder};
     use std::os::fd::{AsFd, AsRawFd};
 
-    use xdp_pppoe_skel::XdpPppoeSkelBuilder;
+    use crate::skel::xdp_pppoe::XdpPppoeSkelBuilder;
 
-    let paths = &rt.paths;
+    let paths = dp.backbone().paths();
     let builder = XdpPppoeSkelBuilder::default();
     let (backing, obj) = OwnedOpenObject::new();
     let mut open_skel = bpf_ctx!(builder.open(obj), "open xdp_pppoe skeleton")?;
@@ -71,15 +64,19 @@ pub fn init_xdp_pppoe(
 
     let skel = bpf_ctx!(open_skel.load(), "load xdp_pppoe skeleton")?;
 
-    let lan_fd = skel.progs.xdp_pppoe_encap_lan.as_fd().as_raw_fd();
-    let next_fd = skel.maps.next_stage.as_fd().as_raw_fd();
+    // PPPoE encap is family-agnostic (one body, two entry programs) and
+    // LAN-side only.
+    let next_stage_fd = skel.maps.next_stage.as_fd().as_raw_fd();
+    for (family, prog_fd) in [
+        (StageFamily::V4, skel.progs.xdp_pppoe_encap_lan_v4.as_fd().as_raw_fd()),
+        (StageFamily::V6, skel.progs.xdp_pppoe_encap_lan_v6.as_fd().as_raw_fd()),
+    ] {
+        dp.xdp().inject_from_lan(
+            FromLanStageType::Pppoe,
+            family,
+            FamilyProg { prog_fd, next_stage_map_fd: next_stage_fd },
+        )?;
+    }
 
-    rt.xdp.inject(ifindex, StageType::Pppoe, lan_fd, 0, next_fd)?;
-
-    Ok(XdpPppoeHandle {
-        runtime: rt.clone(),
-        _skel: skel,
-        _backing: backing,
-        ifindex,
-    })
+    Ok(XdpPppoeHandle { dp: dp.clone(), _skel: skel, _backing: backing })
 }

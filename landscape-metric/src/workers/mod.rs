@@ -5,7 +5,7 @@ use std::sync::{
 use std::time::Duration;
 
 use landscape_common::config::MetricRuntimeConfig;
-use landscape_common::event::ConnectMessage;
+use landscape_common::metric::connect::ConnectMetric;
 use landscape_common::utils::time::now_ms;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -134,7 +134,7 @@ fn handle_connect_metric(
 
 /// Connect 聚合 worker:逐条聚合(flow cache 状态机)→ 攒批 → 投递 connect writer 队列。
 pub(crate) async fn run_connect_worker(
-    mut connect_rx: mpsc::Receiver<ConnectMessage>,
+    mut connect_rx: mpsc::Receiver<ConnectMetric>,
     writer_tx: ConnectBatchTx,
     queue_stats: WriteQueueStats,
     config: MetricRuntimeConfig,
@@ -187,7 +187,7 @@ pub(crate) async fn run_connect_worker(
             _ = shutdown.cancelled() => break,
             msg_opt = connect_rx.recv(), if !connect_closed => {
                 match msg_opt {
-                    Some(ConnectMessage::Metric(metric)) => {
+                    Some(metric) => {
                         handle_connect_metric(
                             &writer_tx,
                             &queue_stats,
@@ -218,7 +218,7 @@ pub(crate) async fn run_connect_worker(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             msg_opt = connect_rx.recv() => match msg_opt {
-                Some(ConnectMessage::Metric(metric)) => {
+                Some(metric) => {
                     handle_connect_metric(
                         &writer_tx,
                         &queue_stats,
@@ -250,6 +250,8 @@ pub(crate) mod testing {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
 
+    use hickory_proto::op::ResponseCode;
+    use hickory_proto::rr::RecordType;
     use landscape_common::config::{MetricMode, MetricRuntimeConfig};
     use landscape_common::database::error::DbError;
     use landscape_common::metric::connect::{
@@ -260,7 +262,7 @@ pub(crate) mod testing {
         DnsHistoryQueryParams, DnsHistoryResponse, DnsLightweightSummaryResponse,
         DnsSummaryQueryParams, DnsSummaryResponse,
     };
-    use landscape_common::metric::dns::{DnsMetric, DnsOutcome};
+    use landscape_common::metric::dns::{DnsMetric, DnsMetricEvent, DnsOutcome};
 
     use crate::agg::dns_bucket::DnsBucketRow;
     use crate::agg::dns_bucket::DnsSummaryParts;
@@ -328,6 +330,20 @@ pub(crate) mod testing {
             domain: "example.com".to_string(),
             query_type: "A".to_string(),
             response_code: "NOERROR".to_string(),
+            status: DnsOutcome::Normal,
+            report_time,
+            duration_ms: 12,
+            src_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            answers: Vec::new(),
+        }
+    }
+
+    pub(crate) fn dns_metric_event(report_time: u64) -> DnsMetricEvent {
+        DnsMetricEvent {
+            flow_id: 1,
+            domain: Arc::from("example.com"),
+            query_type: RecordType::A,
+            response_code: ResponseCode::NoError,
             status: DnsOutcome::Normal,
             report_time,
             duration_ms: 12,
@@ -458,7 +474,6 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{RecordingSink, closed_metric, connect_metric, test_caches, test_config};
     use super::*;
-    use landscape_common::event::ConnectMessage;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -585,8 +600,8 @@ mod tests {
         ));
 
         // Disabled 状态每条产出 3 bucket + 1 summary = 4 ops ≥ write_batch_size(2),立即 flush。
-        connect_tx.send(ConnectMessage::Metric(closed_metric(1, 60_000, 100))).await.unwrap();
-        connect_tx.send(ConnectMessage::Metric(closed_metric(2, 60_000, 200))).await.unwrap();
+        connect_tx.send(closed_metric(1, 60_000, 100)).await.unwrap();
+        connect_tx.send(closed_metric(2, 60_000, 200)).await.unwrap();
         drop(connect_tx);
         tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap();
 
@@ -617,7 +632,7 @@ mod tests {
             shutdown.clone(),
         ));
 
-        connect_tx.send(ConnectMessage::Metric(closed_metric(1, 60_000, 100))).await.unwrap();
+        connect_tx.send(closed_metric(1, 60_000, 100)).await.unwrap();
 
         // 等待 worker 消费消息并写入 flow cache,确保 metric 进入 pending 后才触发 shutdown。
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

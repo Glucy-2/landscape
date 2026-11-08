@@ -7,6 +7,8 @@
 #include "base/proto_def.h"
 #include "chain/tc_stage.h"
 #include "chain/tc_wan_exit_maps.h"
+#include "reader/tc_mss4.h"
+#include "reader/tc_mss6.h"
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -19,57 +21,9 @@ const volatile u32 current_l3_offset = 14;
 #define TCP_OPT_MSS 2
 #define TCP_HDR_LEN 20
 
-#undef BPF_LOG_TOPIC
-
-static __always_inline int extract_ipv6_tcp_offset(struct __sk_buff *skb, u32 l3_offset,
-                                                   u32 *ip_hdr_len) {
-    struct ipv6hdr *ip6h;
-    if (VALIDATE_READ_DATA(skb, &ip6h, l3_offset, sizeof(*ip6h))) return TC_ACT_SHOT;
-
-    if (ip6h->version != 6) return TC_ACT_SHOT;
-
-    u32 offset = l3_offset;
-    u32 len = sizeof(struct ipv6hdr);
-    u8 nexthdr = ip6h->nexthdr;
-    struct ipv6_opt_hdr *opthdr;
-
-#pragma unroll
-    for (int i = 0; i < LD_MAX_IPV6_EXT_NUM; i++) {
-        switch (nexthdr) {
-        case NEXTHDR_FRAGMENT:
-        case NEXTHDR_AUTH:
-            return TC_ACT_UNSPEC;
-        case NEXTHDR_HOP:
-        case NEXTHDR_ROUTING:
-        case NEXTHDR_DEST: {
-            if (VALIDATE_READ_DATA(skb, &opthdr, offset + len, sizeof(*opthdr))) return TC_ACT_SHOT;
-
-            nexthdr = opthdr->nexthdr;
-            len += (opthdr->hdrlen + 1) * 8;
-            break;
-        }
-        default:
-            goto found_tcp;
-        }
-    }
-
-found_tcp:
-    if (nexthdr != NEXTHDR_TCP) return TC_ACT_UNSPEC;
-
-    *ip_hdr_len = len;
-    return TC_ACT_OK;
-}
-
-static __always_inline void do_mss_clamp(struct __sk_buff *skb, u32 offset, u16 mss_value) {
-#define BPF_LOG_TOPIC "mss_clamp"
-    struct tcphdr *tcph;
-    if (VALIDATE_READ_DATA(skb, &tcph, offset, sizeof(*tcph))) {
-        return;
-    }
-    if (!tcph->syn) {
-        return;
-    }
-    u8 tcp_size = (tcph->doff * 4);
+static __always_inline void do_mss_clamp(struct __sk_buff *skb, u32 offset, u8 tcp_doff,
+                                         u16 mss_value) {
+    u8 tcp_size = tcp_doff * 4;
     if (tcp_size <= TCP_HDR_LEN) {
         return;
     }
@@ -114,12 +68,12 @@ static __always_inline void do_mss_clamp(struct __sk_buff *skb, u32 offset, u16 
                 __be16 target_mss = bpf_htons(mss_value);
                 if (bpf_l4_csum_replace(skb, offset + offsetof(struct tcphdr, check), mss_val,
                                         target_mss, 2 | 0)) {
-                    ld_bpf_log("modify checksum error");
+                    ld_from_wan_log("modify checksum error");
                     return;
                 }
                 if (bpf_skb_store_bytes(skb, option_offset + 2, &target_mss, sizeof(target_mss),
                                         0)) {
-                    ld_bpf_log("modify mss error");
+                    ld_from_wan_log("modify mss error");
                     return;
                 }
             }
@@ -128,45 +82,68 @@ static __always_inline void do_mss_clamp(struct __sk_buff *skb, u32 offset, u16 
 
         option_pos += opt_len_val;
     }
-
-#undef BPF_LOG_TOPIC
 }
 
-static __always_inline void clamp_tcp_if_present(struct __sk_buff *skb, u32 current_l3_offset,
-                                                 u16 mtu) {
-    int ret = 0;
-    u8 l3_protocol = 0;
-    ret = current_l3_protocol(skb, current_l3_offset, &l3_protocol);
-    if (ret != TC_ACT_OK) return;
+static __always_inline void clamp_tcp_v4(struct __sk_buff *skb, u32 current_l3_offset, u16 mtu) {
+    struct tc_mss4_view view;
 
-    u32 ip_hdr_len;
-    if (l3_protocol == LANDSCAPE_IPV4_TYPE) {
-        struct iphdr *iph;
-        if (VALIDATE_READ_DATA(skb, &iph, current_l3_offset, sizeof(*iph))) return;
-        if (iph->protocol != IPPROTO_TCP) return;
-        ip_hdr_len = iph->ihl * 4;
-    } else {
-        ret = extract_ipv6_tcp_offset(skb, current_l3_offset, &ip_hdr_len);
-        if (ret != TC_ACT_OK) return;
-    }
+    if (!tc_mss4_read(skb, current_l3_offset, &view)) return;
 
-    do_mss_clamp(skb, ip_hdr_len + current_l3_offset, mtu - ip_hdr_len - TCP_HDR_LEN);
+    u32 ip_hdr_len = view.l4_off - current_l3_offset;
+    if (ip_hdr_len + TCP_HDR_LEN >= mtu) return;
+    do_mss_clamp(skb, view.l4_off, view.doff, mtu - ip_hdr_len - TCP_HDR_LEN);
+}
+
+static __always_inline void clamp_tcp_v6(struct __sk_buff *skb, u32 current_l3_offset, u16 mtu) {
+    struct tc_mss6_view view;
+
+    if (!tc_mss6_read(skb, current_l3_offset, &view)) return;
+
+    u32 ip_hdr_len = view.l4_off - current_l3_offset;
+    if (ip_hdr_len + TCP_HDR_LEN >= mtu) return;
+    do_mss_clamp(skb, view.l4_off, view.doff, mtu - ip_hdr_len - TCP_HDR_LEN);
 }
 
 SEC("tc/ingress")
-int tc_mss_wan_ingress(struct __sk_buff *skb) {
-    clamp_tcp_if_present(skb, current_l3_offset, mtu_size);
+int tc_mss_wan_ingress_v4(struct __sk_buff *skb) {
+    if (likely(not_host_direct(skb_mark(skb)))) {
+        clamp_tcp_v4(skb, current_l3_offset, mtu_size);
+    }
 
-    TC_CHAIN_WAN_INGRESS(skb);
-    bpf_tail_call(skb, &tc_pipe_exits_wan_ingress, TC_NEXT_SLOT);
+    TC_FROM_WAN_CHAIN_NEXT(skb, TC_SLOT_V4);
+    TC_FROM_WAN_CHAIN_EXIT(skb);
+    return TC_ACT_OK;
+}
+
+SEC("tc/ingress")
+int tc_mss_wan_ingress_v6(struct __sk_buff *skb) {
+    if (likely(not_host_direct(skb_mark(skb)))) {
+        clamp_tcp_v6(skb, current_l3_offset, mtu_size);
+    }
+
+    TC_FROM_WAN_CHAIN_NEXT(skb, TC_SLOT_V6);
+    TC_FROM_WAN_CHAIN_EXIT(skb);
     return TC_ACT_OK;
 }
 
 SEC("tc/egress")
-int tc_mss_wan_egress(struct __sk_buff *skb) {
-    clamp_tcp_if_present(skb, current_l3_offset, mtu_size);
+int tc_mss_wan_egress_v4(struct __sk_buff *skb) {
+    if (likely(not_host_direct(skb_mark(skb)))) {
+        clamp_tcp_v4(skb, current_l3_offset, mtu_size);
+    }
 
-    TC_CHAIN_WAN_EGRESS(skb);
-    bpf_tail_call(skb, &tc_pipe_exits_wan_egress, TC_NEXT_SLOT);
+    TC_FROM_LAN_CHAIN_NEXT(skb, TC_SLOT_V4);
+    TC_FROM_LAN_CHAIN_EXIT(skb);
+    return TC_ACT_UNSPEC;
+}
+
+SEC("tc/egress")
+int tc_mss_wan_egress_v6(struct __sk_buff *skb) {
+    if (likely(not_host_direct(skb_mark(skb)))) {
+        clamp_tcp_v6(skb, current_l3_offset, mtu_size);
+    }
+
+    TC_FROM_LAN_CHAIN_NEXT(skb, TC_SLOT_V6);
+    TC_FROM_LAN_CHAIN_EXIT(skb);
     return TC_ACT_UNSPEC;
 }

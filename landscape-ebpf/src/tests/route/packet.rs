@@ -9,12 +9,10 @@ use libbpf_rs::{
 };
 
 use crate::tests::{
-    route::packet_builder::{
-        simple_ipv4_tcp, simple_ipv4_udp, simple_ipv6_tcp_syn, simple_ipv6_udp,
-    },
-    scanner::package::{build_ipv6_frag_eth, build_ipv6_frag_nonfirst_eth},
+    helper::wire::RoutePacketTestResult,
+    pkt::{build_ipv6_frag_eth, build_ipv6_frag_nonfirst_eth},
+    pkt::{simple_ipv4_tcp, simple_ipv4_udp, simple_ipv6_tcp_syn, simple_ipv6_udp},
     test_route_packet::TestRoutePacketSkelBuilder,
-    wire::RoutePacketTestResult,
 };
 use zerocopy::FromBytes;
 
@@ -57,7 +55,7 @@ mod tests {
         assert_eq!(result.scan_ret, TC_ACT_OK);
         assert_eq!(result.read_ret, TC_ACT_OK);
         assert_eq!(result.forward_ret, TC_ACT_OK);
-        assert_eq!(result.offset.l3_protocol, LANDSCAPE_IPV4_TYPE);
+        assert_eq!(result.route.l3_protocol, LANDSCAPE_IPV4_TYPE);
         assert_eq!(Ipv4Addr::from(result.v4.saddr.to_be()), src);
         assert_eq!(Ipv4Addr::from(result.v4.daddr.to_be()), dst);
     }
@@ -100,7 +98,7 @@ mod tests {
         let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
         let result = run_route_packet_test(simple_ipv6_tcp_syn(src, dst));
         assert_eq!(result.forward_ret, TC_ACT_OK);
-        assert_eq!(result.offset.l3_protocol, LANDSCAPE_IPV6_TYPE);
+        assert_eq!(result.route.l3_protocol, LANDSCAPE_IPV6_TYPE);
         assert_eq!(Ipv6Addr::from(result.v6.saddr), src);
         assert_eq!(Ipv6Addr::from(result.v6.daddr), dst);
     }
@@ -142,7 +140,7 @@ mod tests {
         let result = run_route_packet_test(build_ipv6_frag_eth());
         assert_eq!(result.scan_ret, TC_ACT_OK);
         assert_eq!(result.read_ret, TC_ACT_OK);
-        assert_eq!(result.offset.l3_protocol, LANDSCAPE_IPV6_TYPE);
+        assert_eq!(result.route.l3_protocol, LANDSCAPE_IPV6_TYPE);
     }
 
     #[test]
@@ -150,6 +148,6 @@ mod tests {
         let result = run_route_packet_test(build_ipv6_frag_nonfirst_eth());
         assert_eq!(result.scan_ret, TC_ACT_OK);
         assert_eq!(result.read_ret, TC_ACT_OK);
-        assert_eq!(result.offset.l3_protocol, LANDSCAPE_IPV6_TYPE);
+        assert_eq!(result.route.l3_protocol, LANDSCAPE_IPV6_TYPE);
     }
 }

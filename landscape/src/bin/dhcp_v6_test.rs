@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -7,6 +7,7 @@ use landscape::{get_iface_by_name, wan_service::ipv6pd_client::v6::dhcp_v6_pd_cl
 use landscape_common::{
     LANDSCAPE_DEFAULE_DHCP_V6_CLIENT_PORT,
     service::{ServiceHandle, ServiceStatus},
+    wan_link::LinkStateHandle,
 };
 use landscape_common::{
     event::hub::IAPrefixEventSender, sys_service::route_service::RouteTargetInfo,
@@ -51,21 +52,20 @@ async fn main() {
     let prefix_sender = IAPrefixEventSender::new(prefix_tx);
     drop(_prefix_rx); // test binary: no event consumer, events are silently discarded
     tokio::spawn(async move {
-        let route_info = RouteTargetInfo {
-            ifindex: 6,
-            weight: 1,
-            mac: iface.mac,
-            is_docker: false,
-            iface_name: "test".to_string(),
-            iface_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            default_route: true,
-            gateway_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            dev_only_nexthop: false,
-        };
+        let route_info = RouteTargetInfo::new_gateway_v6(
+            6,
+            "test",
+            iface.mac,
+            Ipv6Addr::UNSPECIFIED,
+            Ipv6Addr::UNSPECIFIED,
+            true,
+        );
         dhcp_v6_pd_client(
             uuid::Uuid::new_v4(),
+            1,
             args.iface_name,
             iface.index,
+            None,
             iface.mac,
             mac_addr,
             60,
@@ -73,11 +73,19 @@ async fn main() {
             status,
             route_info,
             ip_route,
-            rt.wan_addr_binding(),
+            landscape_ebpf::chain::wan_link::WanLinkDataplane::new(
+                rt.backbone().clone(),
+                rt.xdp_attach().clone(),
+                1,
+                Some(iface.index),
+                iface.mac.is_some(),
+            )
+            .expect("stand up wan link dataplane"),
             prefix_map,
             std::sync::Arc::new(2),
             prefix_sender,
             pd_runtime,
+            LinkStateHandle::new(None).0,
         )
         .await;
     });

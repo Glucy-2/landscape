@@ -1,12 +1,14 @@
 mod firewall;
 mod health_check;
 mod mss;
-mod nat;
+mod nat4;
+mod nat6;
 mod pd;
 pub mod probe;
 mod v4;
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,16 +35,14 @@ use landscape_common::wan_link::{
     WanLinkSectionsSnapshot, WanLinkSectionsStatus, WanLinkStatus, WanLinkStatusHandle,
     WanLinkStatusStore,
 };
-use landscape_common::wan_service::addr_binding::WanAddrBinding;
-use landscape_common::wan_service::firewall::dataplane::FirewallDataplane;
 use landscape_common::wan_service::ipv6_pd::config::DEFAULT_EXPECTED_PD_LEN;
 use landscape_common::wan_service::ipv6_pd::{IPV6PDPrefixStatus, LDIAPrefix};
-use landscape_common::wan_service::mss_clamp::dataplane::MssClampDataplane;
-use landscape_common::wan_service::nat::dataplane::NatDataplane;
-use landscape_common::wan_service::pppoe::PppoeDataplane;
 use landscape_core::pd_prefix::IAPrefixMap;
 use landscape_database::provider::LandscapeDBServiceProvider;
+use landscape_database::static_nat_mapping_v4::repository::StaticNatMappingV4Repository;
 use landscape_database::wan_link::repository::WanLinkRepository;
+use landscape_ebpf::chain::wan_link::WanLinkDataplane;
+use landscape_ebpf::runtime::EbpfRuntime;
 
 use crate::get_iface_by_name;
 use crate::sys_service::route::IpRouteService;
@@ -59,7 +59,13 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SectionTag {
     V4,
-    Nat,
+    Nat4,
+    /// Never broadcast: nat6 has no runtime config of its own (port
+    /// ranges are v4-only), so nothing reconfigures this section; the
+    /// tag exists so the section can filter reconfig events like the
+    /// others.
+    #[allow(dead_code)]
+    Nat6,
     Mss,
     Firewall,
     Pd,
@@ -76,6 +82,27 @@ enum Step {
 type SectionRunner =
     Arc<dyn Fn(SessionIface, WanLinkConfig, ServiceHandle) -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// What a running section pins beyond its attach inputs, deciding when the
+/// framework restarts it:
+///
+/// * `Session` — restart on anchor re-index (`epoch`) or session down; a
+///   lease change on the same anchor is not its business.
+/// * `SessionAndLease` — additionally restart when the v4 lease address
+///   changes (nat4 bakes it into rodata, the health check probes from it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SectionScope {
+    Session,
+    SessionAndLease,
+}
+
+/// The session facts a section's run started with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SectionAnchor {
+    epoch: u64,
+    /// `v4_ip()` at start; compared only for `SessionAndLease` scopes.
+    lease: Option<IpAddr>,
+}
+
 /// One WAN link. The v4 section produces the link's `SessionState`; nat / mss /
 /// firewall / pd wait on it and re-attach when the session is rebuilt or their
 /// config changes. A dead run is retried after a backoff instead of failing the
@@ -83,11 +110,7 @@ type SectionRunner =
 #[derive(Clone)]
 pub struct WanLinkService {
     route_service: IpRouteService,
-    addr_binding: Arc<dyn WanAddrBinding>,
-    pppoe_dataplane: Arc<dyn PppoeDataplane>,
-    nat_dataplane: Arc<dyn NatDataplane>,
-    mss_dataplane: Arc<dyn MssClampDataplane>,
-    firewall_dataplane: Arc<dyn FirewallDataplane>,
+    ebpf_rt: Arc<EbpfRuntime>,
     health_probe: Arc<dyn WanHealthProbe>,
     prefix_map: IAPrefixMap,
     prefix_sender: IAPrefixEventSender,
@@ -96,17 +119,14 @@ pub struct WanLinkService {
     config_channels: Arc<Mutex<HashMap<Uuid, watch::Sender<WanLinkConfig>>>>,
     status_store: WanLinkStatusStore,
     runtime_status_store: WanLinkRuntimeStatusStore,
+    static_nat4_store: StaticNatMappingV4Repository,
 }
 
 impl WanLinkService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         route_service: IpRouteService,
-        addr_binding: Arc<dyn WanAddrBinding>,
-        pppoe_dataplane: Arc<dyn PppoeDataplane>,
-        nat_dataplane: Arc<dyn NatDataplane>,
-        mss_dataplane: Arc<dyn MssClampDataplane>,
-        firewall_dataplane: Arc<dyn FirewallDataplane>,
+        ebpf_rt: Arc<EbpfRuntime>,
         health_probe: Arc<dyn WanHealthProbe>,
         prefix_map: IAPrefixMap,
         prefix_sender: IAPrefixEventSender,
@@ -115,14 +135,11 @@ impl WanLinkService {
         config_channels: Arc<Mutex<HashMap<Uuid, watch::Sender<WanLinkConfig>>>>,
         status_store: WanLinkStatusStore,
         runtime_status_store: WanLinkRuntimeStatusStore,
+        static_nat4_store: StaticNatMappingV4Repository,
     ) -> Self {
         Self {
             route_service,
-            addr_binding,
-            pppoe_dataplane,
-            nat_dataplane,
-            mss_dataplane,
-            firewall_dataplane,
+            ebpf_rt,
             health_probe,
             prefix_map,
             prefix_sender,
@@ -131,6 +148,7 @@ impl WanLinkService {
             config_channels,
             status_store,
             runtime_status_store,
+            static_nat4_store,
         }
     }
 }
@@ -154,7 +172,33 @@ impl ServiceStarterTrait for WanLinkService {
                 "WAN link attach interface not present yet; waiting for it to appear"
             );
         }
+        // The per-link eBPF chain: roots, stage tables and trie
+        // publications owned by exactly this link.  Living in the
+        // service's run state means stopping the service tears the
+        // chain down (last Arc drop).
+        let (dp_ifindex, dp_has_eth) = match &carrier {
+            Some(iface) => (Some(iface.index), iface.mac.is_some()),
+            None => (None, false),
+        };
         let (link_state, state_rx) = LinkStateHandle::new(carrier);
+        let dataplane = match WanLinkDataplane::new(
+            self.ebpf_rt.backbone().clone(),
+            self.ebpf_rt.xdp_attach().clone(),
+            config.link_chain_id,
+            dp_ifindex,
+            dp_has_eth,
+        ) {
+            Ok(dp) => dp,
+            Err(e) => {
+                tracing::error!(
+                    iface = %config.attach_iface_name,
+                    error = %e,
+                    "failed to stand up the wan link dataplane"
+                );
+                link_status.just_change_status(ServiceStatus::Failed);
+                return link_status;
+            }
+        };
 
         let sections = Arc::new(WanLinkSectionsStatus::default());
         sections.set_v4(V4Runtime::Idle);
@@ -174,7 +218,8 @@ impl ServiceStarterTrait for WanLinkService {
             .set_session(if active { ServiceStatus::Staring } else { ServiceStatus::Disabled })
             .await;
         board.set_section(SectionKind::Pd, ServiceStatus::Stop).await;
-        board.set_section(SectionKind::Nat, ServiceStatus::Stop).await;
+        board.set_section(SectionKind::Nat4, ServiceStatus::Stop).await;
+        board.set_section(SectionKind::Nat6, ServiceStatus::Stop).await;
         board.set_section(SectionKind::Firewall, ServiceStatus::Stop).await;
         board.set_section(SectionKind::Mss, ServiceStatus::Stop).await;
         board.set_section(SectionKind::HealthCheck, ServiceStatus::Stop).await;
@@ -215,8 +260,7 @@ impl ServiceStarterTrait for WanLinkService {
             let cfg_rx = cfg_rx.clone();
             let reconfig_rx = reconfig_tx.subscribe();
             let route_service = self.route_service.clone();
-            let addr_binding = self.addr_binding.clone();
-            let pppoe_dataplane = self.pppoe_dataplane.clone();
+            let chain_dataplane = dataplane.clone();
             let attach = config.attach_iface_name.clone();
             let board = board.clone();
             let v4_runtime = v4_runtime.clone();
@@ -232,8 +276,7 @@ impl ServiceStarterTrait for WanLinkService {
                         cfg_rx,
                         reconfig_rx,
                         route_service,
-                        addr_binding,
-                        pppoe_dataplane,
+                        chain_dataplane,
                         v4_runtime,
                         DEFAULT_RESTART_BACKOFF,
                     )
@@ -248,26 +291,77 @@ impl ServiceStarterTrait for WanLinkService {
             state_rx.clone(),
             cfg_rx.clone(),
             reconfig_tx.subscribe(),
-            SectionTag::Nat,
-            SectionKind::Nat,
+            SectionTag::Nat4,
+            SectionKind::Nat4,
             task_label::task::NAT_RUN,
             |cfg| cfg.nat.enable,
             |state| state.has_v4_lease(),
+            SectionScope::SessionAndLease,
             {
-                let dataplane = self.nat_dataplane.clone();
-                let nat_runtime = sections.nat_slot();
+                let dataplane = dataplane.clone();
+                let nat_runtime = sections.nat4_slot();
+                let state_rx = state_rx.clone();
+                let ebpf_rt = self.ebpf_rt.clone();
+                let static_nat4_store = self.static_nat4_store.clone();
                 Arc::new(move |iface, cfg, status| {
                     let dataplane = dataplane.clone();
                     let nat_runtime = nat_runtime.clone();
+                    let mut state_rx = state_rx.clone();
+                    let ebpf_rt = ebpf_rt.clone();
+                    let static_nat4_store = static_nat4_store.clone();
                     Box::pin(async move {
-                        nat::run(
+                        let runtime = RuntimeWanLinkConfig::from_config(&cfg);
+                        // The ready gate guarantees a v4 lease; read its
+                        // address to bake into the NAT objects.
+                        let wan_addr = match state_rx.borrow_and_update().session.v4_ip() {
+                            Some(std::net::IpAddr::V4(addr)) => addr,
+                            _ => {
+                                tracing::error!(
+                                    "nat4 started without a v4 lease for {}",
+                                    iface.iface_name
+                                );
+                                status.just_change_status(ServiceStatus::Failed);
+                                return;
+                            }
+                        };
+                        nat4::run(
                             iface,
-                            RuntimeWanLinkConfig::from_config(&cfg).nat,
+                            runtime.nat,
+                            wan_addr,
                             status,
                             dataplane,
                             nat_runtime,
+                            static_nat4_store,
+                            ebpf_rt.subscribe_static_nat4(),
                         )
                         .await;
+                    })
+                })
+            },
+        );
+
+        self.spawn_section(
+            &link_status,
+            &board,
+            state_rx.clone(),
+            cfg_rx.clone(),
+            reconfig_tx.subscribe(),
+            SectionTag::Nat6,
+            SectionKind::Nat6,
+            task_label::task::NAT_RUN,
+            |cfg| cfg.nat.enable,
+            |state| state.has_v6_prefix(),
+            SectionScope::Session,
+            {
+                let dataplane = dataplane.clone();
+                let nat_runtime = sections.nat6_slot();
+                let state_rx = state_rx.clone();
+                Arc::new(move |iface, _cfg, status| {
+                    let dataplane = dataplane.clone();
+                    let nat_runtime = nat_runtime.clone();
+                    let state_rx = state_rx.clone();
+                    Box::pin(async move {
+                        nat6::run(iface, state_rx, status, dataplane, nat_runtime).await;
                     })
                 })
             },
@@ -284,21 +378,16 @@ impl ServiceStarterTrait for WanLinkService {
             task_label::task::MSS_CLAMP_RUN,
             |cfg| cfg.mss.enable,
             |state| state.is_up(),
+            SectionScope::Session,
             {
-                let dataplane = self.mss_dataplane.clone();
+                let dataplane = dataplane.clone();
                 let mss_runtime = sections.mss_slot();
                 Arc::new(move |iface, cfg, status| {
                     let dataplane = dataplane.clone();
                     let mss_runtime = mss_runtime.clone();
                     Box::pin(async move {
-                        mss::run(
-                            iface,
-                            RuntimeWanLinkConfig::from_config(&cfg).mss,
-                            status,
-                            dataplane,
-                            mss_runtime,
-                        )
-                        .await;
+                        let runtime = RuntimeWanLinkConfig::from_config(&cfg);
+                        mss::run(iface, runtime.mss, status, dataplane, mss_runtime).await;
                     })
                 })
             },
@@ -315,21 +404,17 @@ impl ServiceStarterTrait for WanLinkService {
             task_label::task::FIREWALL_RUN,
             |cfg| cfg.firewall.enable,
             |state| state.is_up(),
+            SectionScope::Session,
             {
-                let dataplane = self.firewall_dataplane.clone();
+                let dataplane = dataplane.clone();
                 let firewall_runtime = sections.firewall_slot();
                 Arc::new(move |iface, cfg, status| {
                     let dataplane = dataplane.clone();
                     let firewall_runtime = firewall_runtime.clone();
                     Box::pin(async move {
-                        firewall::run(
-                            iface,
-                            RuntimeWanLinkConfig::from_config(&cfg).firewall,
-                            status,
-                            dataplane,
-                            firewall_runtime,
-                        )
-                        .await;
+                        let runtime = RuntimeWanLinkConfig::from_config(&cfg);
+                        firewall::run(iface, runtime.firewall, status, dataplane, firewall_runtime)
+                            .await;
                     })
                 })
             },
@@ -346,33 +431,38 @@ impl ServiceStarterTrait for WanLinkService {
             task_label::task::WAN_IPV6PD_OBSERVER,
             |cfg| cfg.pd.enable,
             |state| state.is_up(),
+            SectionScope::Session,
             {
                 let route_service = self.route_service.clone();
-                let addr_binding = self.addr_binding.clone();
+                let chain_dataplane = dataplane.clone();
                 let prefix_map = self.prefix_map.clone();
                 let prefix_sender = self.prefix_sender.clone();
                 let shared_wan_iid = self.shared_wan_iid.clone();
                 let pd_runtime = pd_runtime.clone();
+                let link_state = link_state.clone();
                 Arc::new(move |iface, cfg, status| {
                     let runtime = RuntimeWanLinkConfig::from_config(&cfg);
                     let route_service = route_service.clone();
-                    let addr_binding = addr_binding.clone();
+                    let chain_dataplane = chain_dataplane.clone();
                     let prefix_map = prefix_map.clone();
                     let prefix_sender = prefix_sender.clone();
                     let shared_wan_iid = shared_wan_iid.clone();
                     let pd_runtime = pd_runtime.clone();
+                    let link_state = link_state.clone();
                     Box::pin(async move {
                         pd::run(
                             runtime.id,
+                            runtime.link_chain_id,
                             iface,
                             runtime.pd,
                             status,
                             route_service,
-                            addr_binding,
+                            chain_dataplane,
                             prefix_map,
                             shared_wan_iid,
                             prefix_sender,
                             pd_runtime,
+                            link_state,
                         )
                         .await;
                     })
@@ -391,6 +481,7 @@ impl ServiceStarterTrait for WanLinkService {
             task_label::task::WAN_LINK_HEALTH_CHECK,
             health_check_enabled,
             |state| state.has_v4_lease(),
+            SectionScope::SessionAndLease,
             {
                 let probe = self.health_probe.clone();
                 let route_service = self.route_service.clone();
@@ -444,6 +535,7 @@ impl WanLinkService {
         label: &'static str,
         enabled: fn(&WanLinkConfig) -> bool,
         ready: fn(&SessionState) -> bool,
+        scope: SectionScope,
         runner: SectionRunner,
     ) {
         let status = link_status.clone();
@@ -461,6 +553,7 @@ impl WanLinkService {
                 label,
                 enabled,
                 ready,
+                scope,
                 runner,
                 DEFAULT_RESTART_BACKOFF,
             )
@@ -559,7 +652,7 @@ fn config_change_tags(applied: &WanLinkConfig, new: &WanLinkConfig) -> Vec<Secti
     let new_rt = RuntimeWanLinkConfig::from_config(new);
     let old_rt = RuntimeWanLinkConfig::from_config(applied);
     if new_rt.nat != old_rt.nat {
-        tags.push(SectionTag::Nat);
+        tags.push(SectionTag::Nat4);
     }
     if new_rt.mss != old_rt.mss {
         tags.push(SectionTag::Mss);
@@ -632,11 +725,18 @@ async fn wait_session_ready(
     }
 }
 
-async fn wait_session_invalidated(state_rx: &mut watch::Receiver<LinkState>, epoch: u64) {
+async fn wait_section_invalidated(
+    state_rx: &mut watch::Receiver<LinkState>,
+    scope: SectionScope,
+    anchor: &SectionAnchor,
+) {
     loop {
         {
             let snapshot = state_rx.borrow_and_update();
-            if !snapshot.session.is_up() || snapshot.session.epoch != epoch {
+            let session = &snapshot.session;
+            let lease_changed =
+                scope == SectionScope::SessionAndLease && session.v4_ip() != anchor.lease;
+            if !session.is_up() || session.epoch != anchor.epoch || lease_changed {
                 return;
             }
         }
@@ -655,8 +755,7 @@ async fn run_v4_supervisor(
     mut cfg_rx: watch::Receiver<WanLinkConfig>,
     mut reconfig_rx: broadcast::Receiver<SectionTag>,
     route_service: IpRouteService,
-    addr_binding: Arc<dyn WanAddrBinding>,
-    pppoe_dataplane: Arc<dyn PppoeDataplane>,
+    chain_dataplane: Arc<WanLinkDataplane>,
     v4_runtime: Arc<ArcSwap<V4Runtime>>,
     backoff: Duration,
 ) {
@@ -692,15 +791,14 @@ async fn run_v4_supervisor(
         let run_child = run.clone();
         let session = Some(link_state.clone());
         let rs = route_service.clone();
-        let ab = addr_binding.clone();
-        let dp = pppoe_dataplane.clone();
+        let cd = chain_dataplane.clone();
         let vr = v4_runtime.clone();
         let resource = iface.name.clone();
         let join = run.spawn_task_with_resource(
             task_label::task::WAN_LINK_V4_SUPERVISOR,
             resource,
             async move {
-                v4::run(iface, runtime, run_child, rs, ab, dp, session, vr).await;
+                v4::run(iface, runtime, run_child, rs, cd, session, vr).await;
             },
         );
         tokio::pin!(join);
@@ -768,6 +866,7 @@ async fn run_dependent_section(
     label: &'static str,
     enabled: fn(&WanLinkConfig) -> bool,
     ready: fn(&SessionState) -> bool,
+    scope: SectionScope,
     runner: SectionRunner,
     backoff: Duration,
 ) {
@@ -796,10 +895,19 @@ async fn run_dependent_section(
             board.set_section(kind, ServiceStatus::Stop).await;
             return;
         }
-        let (iface, epoch) = {
+        let (iface, anchor) = {
             let snapshot = state_rx.borrow_and_update();
             match &snapshot.session.phase {
-                SessionPhase::Up { iface, .. } => (iface.clone(), snapshot.session.epoch),
+                SessionPhase::Up { iface, .. } => {
+                    let anchor = SectionAnchor {
+                        epoch: snapshot.session.epoch,
+                        lease: match scope {
+                            SectionScope::Session => None,
+                            SectionScope::SessionAndLease => snapshot.session.v4_ip(),
+                        },
+                    };
+                    (iface.clone(), anchor)
+                }
                 SessionPhase::Down => continue,
             }
         };
@@ -824,7 +932,9 @@ async fn run_dependent_section(
             let mut step: Option<Step> = None;
             tokio::select! {
                 _ = stop.cancelled() => step = Some(Step::Stop),
-                _ = wait_session_invalidated(&mut state_rx, epoch) => step = Some(Step::Restart),
+                _ = wait_section_invalidated(&mut state_rx, scope, &anchor) => {
+                    step = Some(Step::Restart)
+                }
                 event = reconfig_rx.recv() => match event {
                     Ok(tag) if tag == my_tag => step = Some(Step::Restart),
                     Ok(_) => {}
@@ -921,6 +1031,9 @@ impl ConfigStoreServiceController for WanLinkServiceManagerService {
         let old = self.get_store().delete_and_get(id).await?;
         let Some(old) = old else { return Ok(None) };
         let status = self.get_service().stop_service(id.to_string()).await;
+        // The whole link is gone: stopping the service above reaps its
+        // tasks, dropping the per-link dataplane (which unpublishes the
+        // link's trie entries and removes its chain roots on drop).
         self.status_store.write().await.remove(&id);
         self.runtime_status_store.remove(&id);
         self.config_channels.lock().unwrap().remove(&id);
@@ -935,17 +1048,14 @@ impl WanLinkServiceManagerService {
         store_service: LandscapeDBServiceProvider,
         mut dev_observer: IfaceEventReader,
         route_service: IpRouteService,
-        addr_binding: Arc<dyn WanAddrBinding>,
-        pppoe_dataplane: Arc<dyn PppoeDataplane>,
-        nat_dataplane: Arc<dyn NatDataplane>,
-        mss_dataplane: Arc<dyn MssClampDataplane>,
-        firewall_dataplane: Arc<dyn FirewallDataplane>,
+        ebpf_rt: Arc<EbpfRuntime>,
         health_probe: Arc<dyn WanHealthProbe>,
         prefix_map: IAPrefixMap,
         prefix_sender: IAPrefixEventSender,
         shared_wan_iid: Arc<u64>,
     ) -> Self {
         let store = store_service.wan_link_store();
+        let static_nat4_store = store_service.static_nat_mapping_v4_store();
 
         let (iface_events, _) = broadcast::channel(128);
         let config_channels: Arc<Mutex<HashMap<Uuid, watch::Sender<WanLinkConfig>>>> =
@@ -955,11 +1065,7 @@ impl WanLinkServiceManagerService {
 
         let starter = WanLinkService::new(
             route_service,
-            addr_binding,
-            pppoe_dataplane,
-            nat_dataplane,
-            mss_dataplane,
-            firewall_dataplane,
+            ebpf_rt.clone(),
             health_probe,
             prefix_map.clone(),
             prefix_sender,
@@ -968,6 +1074,7 @@ impl WanLinkServiceManagerService {
             config_channels.clone(),
             status_store.clone(),
             runtime_status_store.clone(),
+            static_nat4_store,
         );
         let service = ServiceManager::init(store.list().await.unwrap(), starter).await;
 

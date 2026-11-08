@@ -7,19 +7,23 @@ use libbpf_rs::{
     skel::{OpenSkel, SkelBuilder as _},
 };
 
+use std::net::Ipv4Addr;
+
+use crate::maps::wan_trie::builder::{v4_entry, wan_trie_publish};
+use crate::maps::wan_trie::dispatcher::cast_arena_tbl;
 use crate::maps::{Route4CacheKey, Route4CacheValue};
-use crate::tests::net_utils::{
+use crate::skel::xdp_lan_exit::XdpLanExitSkelBuilder;
+use crate::skel::xdp_lan_root::XdpLanRootSkelBuilder;
+use crate::skel::xdp_lan_route::XdpLanRouteSkelBuilder;
+use crate::skel::xdp_mss::XdpMssSkelBuilder;
+use crate::skel::xdp_wan_intro::XdpWanIntroSkelBuilder;
+use crate::skel::xdp_wan_root::XdpWanRootSkelBuilder;
+use crate::skel::xdp_wan_route::XdpWanRouteSkelBuilder;
+use crate::tests::helper::net::{
     NetNsGuard, VethPair, dummy_recv_count, dummy_reset, route_slot, send_raw_packet, settle,
     wait_for,
 };
 use crate::tests::test_xdp_dummy::TestXdpDummySkelBuilder;
-use crate::tests::wan_intro_skel::XdpWanIntroSkelBuilder;
-use crate::tests::xdp_lan_exit_skel::XdpLanExitSkelBuilder;
-use crate::tests::xdp_lan_root_skel::XdpLanRootSkelBuilder;
-use crate::tests::xdp_lan_route_skel::XdpLanRouteSkelBuilder;
-use crate::tests::xdp_mss_skel::XdpMssSkelBuilder;
-use crate::tests::xdp_wan_root_skel::XdpWanRootSkelBuilder;
-use crate::tests::xdp_wan_route_skel::XdpWanRouteSkelBuilder;
 
 fn build_ipv4_tcp_pkt(
     src_mac: [u8; 6],
@@ -281,14 +285,19 @@ fn xdp_lan_route_wan_pipeline() {
 
     let share_pin = crate::tests::isolated_pin_root("xdp-lr-pipe");
     let maps = crate::tests::init_shared_maps_for_test(&share_pin);
-    // A→C: slot target → wan_h
+    // Root prog-arrays and the dispatch trie are keyed by the WAN link's
+    // chain id (ifindex keys are gone).
+    const TEST_CHAIN: u32 = 9;
+    // A→C: slot target → wan_h (link_chain_id at bytes 16..18 of the
+    // 20-byte route4_target_info)
     {
         let s = route_slot(0xCB007101);
         let mut k = [0u8; 8];
-        let mut v = [0u8; 16];
+        let mut v = [0u8; 20];
         k[0..4].copy_from_slice(&0u32.to_ne_bytes());
         k[4..8].copy_from_slice(&s.to_ne_bytes());
         v[0..4].copy_from_slice(&wan_h_i.to_ne_bytes());
+        v[16..18].copy_from_slice(&(TEST_CHAIN as u16).to_ne_bytes());
         maps.rt4_slot_map.update(&k, &v, MapFlags::ANY).unwrap();
     }
     // C→A: lan route → lan_p
@@ -309,7 +318,7 @@ fn xdp_lan_route_wan_pipeline() {
     let mut intro_b = XdpWanIntroSkelBuilder::default();
     intro_b.object_builder_mut().pin_root_path(&share_pin).unwrap();
     let mut intro_obj = std::mem::MaybeUninit::uninit();
-    let intro = intro_b.open(&mut intro_obj).unwrap().load().unwrap();
+    let mut intro = intro_b.open(&mut intro_obj).unwrap().load().unwrap();
 
     let mut wr_b = XdpWanRouteSkelBuilder::default();
     wr_b.object_builder_mut().pin_root_path(&share_pin).unwrap();
@@ -356,11 +365,11 @@ fn xdp_lan_route_wan_pipeline() {
     }
 
     let root_fd = lan_root.progs.xdp_lan_root.as_fd().as_raw_fd();
-    let mss_lan_fd = mss.progs.xdp_mss_lan.as_fd().as_raw_fd();
+    let mss_lan_fd = mss.progs.xdp_mss_lan_v4.as_fd().as_raw_fd();
     let exit_fd = lan_exit.progs.xdp_lan_exit.as_fd().as_raw_fd();
 
     let wan_root_fd = wan_root.progs.xdp_wan_root.as_fd().as_raw_fd();
-    let mss_wan_fd = mss.progs.xdp_mss_wan.as_fd().as_raw_fd();
+    let mss_wan_fd = mss.progs.xdp_mss_wan_v4.as_fd().as_raw_fd();
     let wr_fd = wr.progs.xdp_wan_route_ingress.as_fd().as_raw_fd();
 
     // Mark redirect targets native-XDP able, otherwise xdp_lan_route falls back
@@ -377,7 +386,7 @@ fn xdp_lan_route_wan_pipeline() {
     // ── LAN chain (A→C): lan_route → root → mss → exit ──
     lr.maps
         .xdp_lan_pipe_root_progs
-        .update(&wan_h_i.to_ne_bytes(), &root_fd.to_ne_bytes(), MapFlags::ANY)
+        .update(&TEST_CHAIN.to_ne_bytes(), &root_fd.to_ne_bytes(), MapFlags::ANY)
         .unwrap();
     lan_root
         .maps
@@ -397,32 +406,27 @@ fn xdp_lan_route_wan_pipeline() {
 
     // ── WAN chain (C→A): wan_intro → wan_root → mss → wan_route_ingress ──
     {
-        // dispatch_key layout (16 bytes, 8-byte aligned due to __be64 in union):
-        //   [0..4)  dispatch_type (u32 LE) = 0 (direct IPv4)
-        //   [4..8)  padding
-        //   [8..12) v4._pad = 0
-        //   [12..16) v4.daddr (u32 BE) = 10.0.0.1
-        let daddr_be = u32::from_be(0x0A000001_u32);
-        let mut dispatch_key = [0u8; 16];
-        dispatch_key[12..16].copy_from_slice(&daddr_be.to_ne_bytes());
-        let dispatch_val = wan_h_i.to_ne_bytes();
-        intro
-            .maps
-            .wan_intro_dispatch_map
-            .update(&dispatch_key, &dispatch_val, MapFlags::ANY)
-            .unwrap();
+        // Dispatch trie: route 10.0.0.1 → the WAN link's chain (dispatch
+        // values are chain ids).
+        let data = intro.maps.wan_trie_arena_data.as_mut().unwrap();
+        wan_trie_publish(
+            cast_arena_tbl(&mut data.wan_trie_tbl),
+            &[v4_entry(Ipv4Addr::new(10, 0, 0, 1), 32, TEST_CHAIN).unwrap()],
+        )
+        .unwrap();
     }
     intro
         .maps
         .xdp_pipe_root_progs
-        .update(&wan_h_i.to_ne_bytes(), &wan_root_fd.to_ne_bytes(), MapFlags::ANY)
+        .update(&TEST_CHAIN.to_ne_bytes(), &wan_root_fd.to_ne_bytes(), MapFlags::ANY)
         .unwrap();
     wan_root
         .maps
         .root_next_stage
         .update(&0u32.to_ne_bytes(), &mss_wan_fd.to_ne_bytes(), MapFlags::ANY)
         .unwrap();
-    mss.maps.next_stage.update(&1u32.to_ne_bytes(), &wr_fd.to_ne_bytes(), MapFlags::ANY).unwrap();
+    // XDP_FROM_WAN_SLOT_V4 = 2 (direction x family, see chain/xdp_stage.h)
+    mss.maps.next_stage.update(&2u32.to_ne_bytes(), &wr_fd.to_ne_bytes(), MapFlags::ANY).unwrap();
     wan_root
         .maps
         .xdp_pipe_exits_wan

@@ -24,28 +24,25 @@ char LICENSE[] SEC("license") = "GPL";
 // "exit": the chain ends by deciding where the packet goes.
 
 static __always_inline u8 get_wan_ingress_l3_offset(struct __sk_buff *skb) {
-    return skb->cb[TC_CHAIN_CB_L3_OFFSET];
+    return tc_cb_l3_offset(skb);
 }
-
-#undef BPF_LOG_TOPIC
 
 #define TC_INGRESS_V4_SLOT 0
 #define TC_INGRESS_V6_SLOT 1
 
 SEC("tc/ingress")
 int tc_route4_wan_ingress(struct __sk_buff *skb) {
-#define BPF_LOG_TOPIC "tc_route4_wan_ingress"
     int ret = 0;
     struct route4_context context = {0};
-    struct packet_offset_info offset_info = {0};
+    struct route_view view = {0};
     u8 l3 = get_wan_ingress_l3_offset(skb);
 
-    ret = scan_route_packet(skb, l3, &offset_info);
+    ret = scan_route_packet(skb, l3, &view);
     if (ret != TC_ACT_OK) {
         return TC_ACT_OK;
     }
 
-    ret = route4_read_context_from_scan(skb, &offset_info, &context);
+    ret = route4_read_context_from_scan(skb, &view, &context);
     if (ret != TC_ACT_OK) {
         return TC_ACT_OK;
     }
@@ -63,39 +60,37 @@ int tc_route4_wan_ingress(struct __sk_buff *skb) {
     if (ret == TC_ACT_REDIRECT) {
         u8 mark = get_cache_mask(skb->mark);
         if (mark == INGRESS_STATIC_MARK) {
-            route4_set_cache_in_wan(&context, l3, skb->ifindex);
+            route4_set_cache_in_wan(&context, l3, skb->ifindex, tc_cb_chain(skb));
         }
     }
 
     return ret == TC_ACT_OK ? TC_ACT_OK : ret;
-#undef BPF_LOG_TOPIC
 }
 
 SEC("tc/ingress")
 int tc_route6_wan_ingress(struct __sk_buff *skb) {
-#define BPF_LOG_TOPIC "tc_route6_wan_ingress"
     int ret = 0;
     struct route6_context context = {0};
-    struct packet_offset_info offset_info = {0};
+    struct route_view view = {0};
     u8 l3 = get_wan_ingress_l3_offset(skb);
 
-    ret = scan_route_packet(skb, l3, &offset_info);
+    ret = scan_route_packet(skb, l3, &view);
     if (ret != TC_ACT_OK) {
         return TC_ACT_OK;
     }
 
-    ret = route6_read_context_from_scan(skb, &offset_info, &context);
+    ret = route6_read_context_from_scan(skb, &view, &context);
     if (ret != TC_ACT_OK) {
         return TC_ACT_OK;
     }
 
-    if (unlikely(is_broadcast_ip6(context.daddr.bytes))) {
+    if (unlikely(is_broadcast_ip6(context.daddr.in6_u.u6_addr8))) {
         return TC_ACT_UNSPEC;
     }
 
     ret = route6_is_current_wan_packet(skb, l3, &context);
     if (ret != TC_ACT_OK) {
-        ld_bpf_log("route6_is_current_wan_packet: %pI6", context.daddr.bytes);
+        ld_from_wan_log("route6_is_current_wan_packet: %pI6", context.daddr.in6_u.u6_addr8);
         return ret;
     }
 
@@ -103,12 +98,11 @@ int tc_route6_wan_ingress(struct __sk_buff *skb) {
     if (ret == TC_ACT_REDIRECT) {
         u8 mark = get_cache_mask(skb->mark);
         if (mark == INGRESS_STATIC_MARK) {
-            route6_set_cache_in_wan(&context, l3, skb->ifindex);
+            route6_set_cache_in_wan(&context, l3, skb->ifindex, tc_cb_chain(skb));
         }
     }
 
     return ret == TC_ACT_OK ? TC_ACT_OK : ret;
-#undef BPF_LOG_TOPIC
 }
 
 struct {
@@ -127,8 +121,6 @@ struct {
 
 SEC("tc/ingress")
 int tc_wan_ingress_route(struct __sk_buff *skb) {
-#define BPF_LOG_TOPIC "<<< tc_wan_ingress_route <<<"
-
     bool is_ipv4;
     int ret;
     u8 l3 = get_wan_ingress_l3_offset(skb);
@@ -147,12 +139,11 @@ int tc_wan_ingress_route(struct __sk_buff *skb) {
 
     if (is_ipv4) {
         bpf_tail_call_static(skb, &ls_wan_in_tails, TC_INGRESS_V4_SLOT);
-        ld_bpf_log("bpf_tail_call_static error");
+        ld_from_wan_log("bpf_tail_call_static error");
     } else {
         bpf_tail_call_static(skb, &ls_wan_in_tails, TC_INGRESS_V6_SLOT);
-        ld_bpf_log("bpf_tail_call_static error");
+        ld_from_wan_log("bpf_tail_call_static error");
     }
 
     return TC_ACT_SHOT;
-#undef BPF_LOG_TOPIC
 }

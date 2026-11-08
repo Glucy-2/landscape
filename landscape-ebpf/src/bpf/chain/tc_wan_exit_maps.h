@@ -21,4 +21,9 @@ struct {
     __uint(value_size, sizeof(u32));
 } tc_pipe_exits_wan_egress SEC(".maps");
 
+#define TC_FROM_WAN_CHAIN_EXIT(skb)                                                                \
+    bpf_tail_call_static((skb), &tc_pipe_exits_wan_ingress, TC_NEXT_SLOT)
+#define TC_FROM_LAN_CHAIN_EXIT(skb)                                                                \
+    bpf_tail_call_static((skb), &tc_pipe_exits_wan_egress, TC_NEXT_SLOT)
+
 #endif /* __LD_TC_WAN_EXIT_MAPS_H_ */

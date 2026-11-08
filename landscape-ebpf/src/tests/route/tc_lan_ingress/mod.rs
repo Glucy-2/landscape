@@ -10,13 +10,14 @@
 //!   * no slot target + default flow (mark id 0) → TC_ACT_SHOT, i.e. the TC
 //!     worker drops even default-flow traffic, unlike the XDP/legacy twin
 //!     which passes it (DROP default flow branch);
-//!   * the FLOW_FROM_LAN source bits are written to skb->mark only on two
-//!     paths: search-cache non-OK returns and after a OK verdict — lan_redirect
-//!     and flow-verdict short returns leave the mark untouched;
+//!   * skb->mark is written only on two paths: search-cache non-OK returns
+//!     and after a OK verdict — lan_redirect and flow-verdict short returns
+//!     leave the mark untouched;
 //!   * the docker slot branch returns early and never sets the
 //!     TC_CHAIN_CB_FORWARDED_OFFSET cb flag;
-//!   * a cache hit with ifindex != 0 redirects without learning or setting cb,
-//!     a cache hit with ifindex == 0 goes through pick_wan (cb set);
+//!   * a cache hit with ifindex != 0 redirects without learning but still
+//!     stamps the cb forwarded flag (route4_redirect_by_cached_target);
+//!     a cache hit with ifindex == 0 goes through pick_wan (cb set there too);
 //!   * a WAN-cache hit rewrites the full 14-byte header from the ip_mac value
 //!     (dst mac, dev mac, proto) and does NOT update the flow mark value.
 //!
@@ -35,9 +36,13 @@ use std::{
 };
 
 use landscape_common::{
-    flow::{FlowMarkInfo, ip_mark::IpConfig, ip_mark::IpMarkInfo, mark::FlowMark},
+    flow::{
+        FlowMarkInfo,
+        ip_mark::{IpConfig, IpMarkInfo},
+        mark::{FlowMark, FlowMarkAction},
+    },
     net::MacAddr,
-    sys_service::route_service::RouteTargetInfo,
+    sys_service::route_service::{RouteTargetInfo, WanRouteTarget},
 };
 use libbpf_rs::{
     MapCore, MapFlags, ProgramInput,
@@ -51,24 +56,20 @@ use crate::{
         route::replace_wan_route_slots_v4_with_map,
     },
     tests::{
-        TestSkb, isolated_pin_root,
-        route::{
-            map_helper::{
-                LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE,
-                WAN_IFINDEX, WAN_ROUTE_TYPE, as_bytes, create_route4_cache_inner_map,
-                insert_ip_mac_v4, insert_route4_lan_entry, lookup_ip_mac_v4,
-                lookup_rt4_cache_value, put_rt4_cache_full, put_rt4_cache_ifindex,
-                put_rt4_cache_value, seed_flow_match_ip_v4, seed_flow_match_mac,
-            },
-            packet_builder::{simple_ipv4_tcp, simple_ipv6_tcp_syn},
+        TestSkb,
+        helper::map::{
+            LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE, WAN_IFINDEX,
+            WAN_ROUTE_TYPE, as_bytes, create_route4_cache_inner_map, insert_ip_mac_v4,
+            insert_route4_lan_entry, lookup_ip_mac_v4, lookup_rt4_cache_value, normal_mark,
+            put_rt4_cache_full, put_rt4_cache_ifindex, put_rt4_cache_value, seed_flow_match_ip_v4,
+            seed_flow_match_mac,
         },
+        isolated_pin_root,
+        pkt::{simple_ipv4_tcp, simple_ipv6_tcp_syn},
     },
 };
 
-pub(crate) mod tc_lan_ingress_route {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_lan_ingress_route.skel.rs"));
-}
-use tc_lan_ingress_route::TcLanIngressRouteSkel;
+use crate::skel::tc_lan_ingress_route::TcLanIngressRouteSkel;
 
 const RET_OK: i32 = 0;
 const RET_UNSPEC: i32 = -1;
@@ -106,10 +107,21 @@ fn lan_ctx() -> TestSkb {
 macro_rules! load_skel {
     ($pin:expr, $skel:ident) => {
         let pin_root = isolated_pin_root($pin);
-        let mut builder = tc_lan_ingress_route::TcLanIngressRouteSkelBuilder::default();
+        let mut builder =
+            crate::skel::tc_lan_ingress_route::TcLanIngressRouteSkelBuilder::default();
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = std::mem::MaybeUninit::uninit();
         let $skel = builder.open(&mut open_object).unwrap().load().unwrap();
+    };
+    ($pin:expr, $skel:ident, $l3_offset:expr) => {
+        let pin_root = isolated_pin_root($pin);
+        let mut builder =
+            crate::skel::tc_lan_ingress_route::TcLanIngressRouteSkelBuilder::default();
+        builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
+        let mut open_object = std::mem::MaybeUninit::uninit();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        open_skel.maps.rodata_data.as_deref_mut().unwrap().current_l3_offset = $l3_offset;
+        let $skel = open_skel.load().unwrap();
     };
 }
 
@@ -141,7 +153,7 @@ fn run_lan_ingress(
 /// Seed flow id 0's ip-trie with a single dst rule.
 fn seed_flow_rule(skel: &TcLanIngressRouteSkel<'_>, dst: Ipv4Addr, mark: u32) {
     let rules = vec![IpMarkInfo {
-        mark: FlowMark::from(mark),
+        mark: FlowMark::from(mark as u16),
         cidr: IpConfig { ip: IpAddr::V4(dst), prefix: 32 },
         priority: 100,
     }];
@@ -156,20 +168,11 @@ fn seed_wan_slots(
     is_docker: bool,
     mac: Option<MacAddr>,
 ) {
-    let targets = [(
-        RouteTargetInfo {
-            weight: 0,
-            ifindex,
-            mac,
-            default_route: false,
-            is_docker,
-            iface_name: "test-wan".to_string(),
-            iface_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            gateway_ip: IpAddr::V4(wan_gateway()),
-            dev_only_nexthop: false,
-        },
-        1,
-    )];
+    let mut info = RouteTargetInfo::dummy(ifindex, "test-wan", IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    info.mac = mac;
+    info.is_docker = is_docker;
+    info.gateway_ip = IpAddr::V4(wan_gateway());
+    let targets = [(WanRouteTarget::link(0, info), 1)];
     replace_wan_route_slots_v4_with_map(&skel.maps.rt4_slot_map, flow_id, &targets);
 }
 

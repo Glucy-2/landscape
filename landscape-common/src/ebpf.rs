@@ -1,9 +1,10 @@
 //! Boundary marker for eBPF dataplane capabilities.
 //!
-//! Landscape services receive narrow capability traits (e.g.
-//! [`crate::wan_service::pppoe::PppoeDataplane`]) instead of the full
-//! eBPF runtime.  Attached dataplane state (TC/XDP stages, chain slots)
-//! is handed back as an opaque guard: dropping it tears the state down.
+//! Landscape services receive narrow capability objects (e.g. the
+//! per-link `landscape_ebpf::chain::wan_link::WanLinkDataplane`)
+//! instead of the full eBPF runtime.  Attached dataplane state (TC/XDP
+//! stages, chain slots) is handed back as an opaque guard: dropping it
+//! tears the state down.
 
 /// Opaque teardown guard for an attached eBPF dataplane.
 ///

@@ -9,16 +9,22 @@ pub mod landscape;
 pub mod maps;
 pub mod metric;
 pub mod pppoe;
+pub mod route_backbone;
 pub mod runtime;
 mod runtime_impls;
+pub mod skel;
 pub mod stages;
 pub mod tproxy;
+pub mod xdp_attach;
 
 #[cfg(test)]
 mod test_support;
 
-#[cfg(all(test, feature = "bpf-test"))]
+#[cfg(all(test, feature = "test-support"))]
 mod tests;
+
+#[cfg(all(test, feature = "bench"))]
+mod bench;
 
 pub mod chain;
 pub mod dns_dispatcher;
@@ -31,7 +37,10 @@ pub struct LandscapeMapPath {
     pub wan_ip: PathBuf,
     // NAT
     pub nat6_static_map: PathBuf,
-    pub nat4_static_map: PathBuf,
+    pub frag4_cache_lan: PathBuf,
+    pub frag4_cache_wan: PathBuf,
+    pub frag6_cache_lan: PathBuf,
+    pub frag6_cache_wan: PathBuf,
 
     // 防火墙黑名单
     pub firewall_ipv4_block: PathBuf,
@@ -79,7 +88,7 @@ impl LandscapeMapPath {
     /// paths, skeleton pin reuse and tests all share one source of truth.
     pub fn from_root(root: &Path) -> Self {
         use crate::maps::{
-            dns, firewall, flow, flow_dns, flow_wanip, mac, nat, redirect_able, route, wan,
+            dns, firewall, flow, flow_dns, flow_wanip, frag, mac, nat, redirect_able, route, wan,
         };
 
         let root = root.to_path_buf();
@@ -87,7 +96,10 @@ impl LandscapeMapPath {
             wan_ip: root.join(wan::WAN_IP_BINDING_PIN),
             // NAT
             nat6_static_map: root.join(nat::NAT6_STATIC_MAP_PIN),
-            nat4_static_map: root.join(nat::NAT4_STATIC_MAP_PIN),
+            frag4_cache_lan: root.join(frag::FRAG4_CACHE_LAN_PIN),
+            frag4_cache_wan: root.join(frag::FRAG4_CACHE_WAN_PIN),
+            frag6_cache_lan: root.join(frag::FRAG6_CACHE_LAN_PIN),
+            frag6_cache_wan: root.join(frag::FRAG6_CACHE_WAN_PIN),
 
             // 防火墙黑名单
             firewall_ipv4_block: root.join(firewall::FIREWALL_BLOCK_IP4_MAP_PIN),
@@ -130,17 +142,13 @@ impl LandscapeMapPath {
     }
 
     /// TC chain pin directory (`<root>/tc_chain`), seeded by
-    /// [`crate::runtime::EbpfRuntime::init`] via `TcChainManager::new`.
+    /// [`crate::runtime::EbpfRuntime::init`] via `RouteBackbone::new`.
     pub fn tc_chain_base(&self) -> PathBuf {
         self.root.join("tc_chain")
     }
 
     pub fn tc_pipe_root_progs_path(&self) -> PathBuf {
         self.tc_chain_base().join("tc_pipe_root_progs")
-    }
-
-    pub fn tc_wan_intro_dispatch_path(&self) -> PathBuf {
-        self.tc_chain_base().join("wan_intro_dispatch")
     }
 
     pub fn tc_pipe_exits_wan_ingress_path(&self) -> PathBuf {
@@ -170,15 +178,7 @@ impl LandscapeMapPath {
     pub fn xdp_lan_pipe_root_progs_path(&self) -> PathBuf {
         self.xdp_base.join("lan_pipe_root_progs")
     }
-
-    pub fn xdp_wan_intro_dispatch_path(&self) -> PathBuf {
-        self.xdp_base.join("wan_intro_dispatch")
-    }
 }
-
-// Fire wall -> nat -> pppoe
-// const PPPOE_MTU_FILTER_EGRESS_PRIORITY: u32 = 1;
-const PPPOE_EGRESS_PRIORITY: u32 = 2;
 
 // LAN ingress TC classifier priorities (smaller runs first)
 pub(crate) const TC_LAN_INGRESS_INTRO_PRIORITY: u32 = 1;
@@ -188,7 +188,9 @@ pub(crate) const TC_LAN_INGRESS_DAO_PRIORITY: u32 = 2;
 const LANDSCAPE_IPV4_TYPE: u8 = 0;
 const LANDSCAPE_IPV6_TYPE: u8 = 1;
 
+#[allow(dead_code)]
 const NAT_MAPPING_INGRESS: u8 = 0;
+#[allow(dead_code)]
 const NAT_MAPPING_EGRESS: u8 = 1;
 
 fn bump_memlock_rlimit() {

@@ -1,11 +1,6 @@
-use std::{
-    mem::MaybeUninit,
-    net::{IpAddr, Ipv6Addr},
-    str::FromStr,
-};
+use std::{mem::MaybeUninit, net::Ipv6Addr, str::FromStr};
 
-use etherparse::{Icmpv6Type, PacketBuilder, PacketHeaders, icmpv6};
-use landscape_common::net::MacAddr;
+use etherparse::{IcmpEchoHeader, Icmpv6Type, PacketBuilder, PacketHeaders, icmpv6};
 use libbpf_rs::{
     MapCore, MapFlags, ProgramInput,
     skel::{OpenSkel, SkelBuilder as _},
@@ -13,9 +8,8 @@ use libbpf_rs::{
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
-    maps::wan::add_wan_ip,
     maps::{Nat6TimerKey, Nat6TimerValue},
-    stages::nat::tc_nat_skel::TcNatSkelBuilder,
+    skel::tc_nat6::TcNat6SkelBuilder,
     tests::TestSkb,
 };
 
@@ -50,6 +44,21 @@ fn build_ipv6_tcp(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16) ->
     let payload = [0u8; 0];
     let mut buf = Vec::with_capacity(builder.size(payload.len()));
     builder.write(&mut buf, &payload).unwrap();
+    buf
+}
+
+fn build_ipv6_icmpv6_echo(src: Ipv6Addr, dst: Ipv6Addr, id: u16, request: bool) -> Vec<u8> {
+    let echo = IcmpEchoHeader { id, seq: 1 };
+    let ty = if request { Icmpv6Type::EchoRequest(echo) } else { Icmpv6Type::EchoReply(echo) };
+    let builder = PacketBuilder::ethernet2(
+        [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+        [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+    )
+    .ipv6(src.octets(), dst.octets(), 64)
+    .icmpv6(ty);
+
+    let mut buf = Vec::with_capacity(builder.size(0));
+    builder.write(&mut buf, &[]).unwrap();
     buf
 }
 
@@ -115,21 +124,17 @@ fn assert_egress_ct_status_transition(initial_status: u64, expected_status: u64)
     let prefix_len = 60;
     let key = timer_key_for(src, CLIENT_PORT, prefix_len);
 
-    let mut builder = TcNatSkelBuilder::default();
+    let mut builder = TcNat6SkelBuilder::default();
     let pin_root = crate::tests::isolated_pin_root("nat-v6-dynamic-v3");
     builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
     let mut open_object = MaybeUninit::uninit();
-    let open_skel = builder.open(&mut open_object).unwrap();
+    let mut open_skel = builder.open(&mut open_object).unwrap();
+    {
+        let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+        rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+        rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(prefix_len);
+    }
     let skel = open_skel.load().unwrap();
-
-    add_wan_ip(
-        &skel.maps.wan_ip_binding,
-        IFINDEX,
-        IpAddr::V6(wan_ip()),
-        None,
-        prefix_len,
-        Some(MacAddr::broadcast()),
-    );
     add_ct6_entry(&skel.maps.nat6_timer_map, &key, src, dst, 443);
     set_ct6_status(&skel.maps.nat6_timer_map, &key, initial_status);
 
@@ -143,7 +148,7 @@ fn assert_egress_ct_status_transition(initial_status: u64, expected_status: u64)
         ..Default::default()
     };
 
-    let result = skel.progs.tc_nat_wan_egress.test_run(input).expect("test_run failed");
+    let result = skel.progs.tc_nat_wan_egress_v6.test_run(input).expect("test_run failed");
     assert_eq!(
         result.return_value as i32, -1,
         "timer status contention must not fail the current packet"
@@ -154,21 +159,17 @@ fn assert_egress_ct_status_transition(initial_status: u64, expected_status: u64)
 fn assert_dynamic_translation(src: Ipv6Addr, dst: Ipv6Addr, prefix_len: u8) {
     let key = timer_key_for(src, CLIENT_PORT, prefix_len);
 
-    let mut builder = TcNatSkelBuilder::default();
+    let mut builder = TcNat6SkelBuilder::default();
     let pin_root = crate::tests::isolated_pin_root("nat-v6-dynamic-v3");
     builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
     let mut open_object = MaybeUninit::uninit();
-    let open_skel = builder.open(&mut open_object).unwrap();
+    let mut open_skel = builder.open(&mut open_object).unwrap();
+    {
+        let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+        rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+        rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(prefix_len);
+    }
     let skel = open_skel.load().unwrap();
-
-    add_wan_ip(
-        &skel.maps.wan_ip_binding,
-        IFINDEX,
-        IpAddr::V6(wan_ip()),
-        None,
-        prefix_len,
-        Some(MacAddr::broadcast()),
-    );
     add_ct6_entry(&skel.maps.nat6_timer_map, &key, src, dst, 443);
 
     let pkt = build_ipv6_tcp(src, dst, CLIENT_PORT, 443);
@@ -181,7 +182,7 @@ fn assert_dynamic_translation(src: Ipv6Addr, dst: Ipv6Addr, prefix_len: u8) {
         ..Default::default()
     };
 
-    let result = skel.progs.tc_nat_wan_egress.test_run(input).expect("test_run failed");
+    let result = skel.progs.tc_nat_wan_egress_v6.test_run(input).expect("test_run failed");
     assert_eq!(result.return_value as i32, -1, "egress should return TC_ACT_UNSPEC(-1)");
 
     let pkt_out = PacketHeaders::from_ethernet_slice(&packet_out).expect("parse output");
@@ -215,21 +216,17 @@ fn assert_prefix_refresh(old_src: Ipv6Addr, new_src: Ipv6Addr, prefix_len: u8) {
     let new_key = timer_key_for(new_src, CLIENT_PORT, prefix_len);
     assert_eq!(old_key, new_key, "test setup must keep the same dynamic NAT key",);
 
-    let mut builder = TcNatSkelBuilder::default();
+    let mut builder = TcNat6SkelBuilder::default();
     let pin_root = crate::tests::isolated_pin_root("nat-v6-dynamic-v3");
     builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
     let mut open_object = MaybeUninit::uninit();
-    let open_skel = builder.open(&mut open_object).unwrap();
+    let mut open_skel = builder.open(&mut open_object).unwrap();
+    {
+        let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+        rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+        rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(prefix_len);
+    }
     let skel = open_skel.load().unwrap();
-
-    add_wan_ip(
-        &skel.maps.wan_ip_binding,
-        IFINDEX,
-        IpAddr::V6(wan_ip()),
-        None,
-        prefix_len,
-        Some(MacAddr::broadcast()),
-    );
     add_ct6_entry(&skel.maps.nat6_timer_map, &old_key, old_src, old_remote, 443);
 
     let pkt = build_ipv6_tcp(new_src, new_remote, CLIENT_PORT, 8443);
@@ -242,7 +239,7 @@ fn assert_prefix_refresh(old_src: Ipv6Addr, new_src: Ipv6Addr, prefix_len: u8) {
         ..Default::default()
     };
 
-    let result = skel.progs.tc_nat_wan_egress.test_run(input).expect("test_run failed");
+    let result = skel.progs.tc_nat_wan_egress_v6.test_run(input).expect("test_run failed");
     assert_eq!(result.return_value as i32, -1, "egress should return TC_ACT_UNSPEC(-1)");
 
     let value = lookup_ct6_entry(&skel.maps.nat6_timer_map, &new_key);
@@ -358,6 +355,69 @@ mod tests {
     }
 
     #[test]
+    fn icmpv6_echo_round_trip_dynamic_v3() {
+        let src = lan_host();
+        let dst = remote();
+        let id = 0x1234;
+        let prefix_len = 60;
+
+        let mut builder = TcNat6SkelBuilder::default();
+        let pin_root = crate::tests::isolated_pin_root("nat-v6-dynamic-echo");
+        builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
+        let mut open_object = MaybeUninit::uninit();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(prefix_len);
+        }
+        let skel = open_skel.load().unwrap();
+
+        let request = build_ipv6_icmpv6_echo(src, dst, id, true);
+        let mut out = vec![0u8; request.len()];
+        let mut ctx = TestSkb { ifindex: IFINDEX, ..Default::default() };
+        let result = skel
+            .progs
+            .tc_nat_wan_egress_v6
+            .test_run(ProgramInput {
+                data_in: Some(&request),
+                context_in: Some(ctx.as_mut_bytes()),
+                data_out: Some(&mut out),
+                ..Default::default()
+            })
+            .expect("egress test_run failed");
+        assert_eq!(result.return_value as i32, -1);
+
+        let translated = npt_wan_ip_for(src);
+        let parsed = PacketHeaders::from_ethernet_slice(&out).expect("parse egress output");
+        let Some(etherparse::NetHeaders::Ipv6(ipv6, _)) = parsed.net else {
+            panic!("expected IPv6 egress output");
+        };
+        assert_eq!(Ipv6Addr::from(ipv6.source), translated);
+
+        let reply = build_ipv6_icmpv6_echo(dst, translated, id, false);
+        let mut out = vec![0u8; reply.len()];
+        let mut ctx = TestSkb { ifindex: IFINDEX, ..Default::default() };
+        let result = skel
+            .progs
+            .tc_nat_wan_ingress_v6
+            .test_run(ProgramInput {
+                data_in: Some(&reply),
+                context_in: Some(ctx.as_mut_bytes()),
+                data_out: Some(&mut out),
+                ..Default::default()
+            })
+            .expect("ingress test_run failed");
+        assert_eq!(result.return_value as i32, 0);
+
+        let parsed = PacketHeaders::from_ethernet_slice(&out).expect("parse ingress output");
+        let Some(etherparse::NetHeaders::Ipv6(ipv6, _)) = parsed.net else {
+            panic!("expected IPv6 ingress output");
+        };
+        assert_eq!(Ipv6Addr::from(ipv6.destination), src);
+    }
+
+    #[test]
     fn tcp_egress_dynamic_v3_icmp_error_ipv6() {
         let src = lan_host();
         let dst = remote();
@@ -367,21 +427,17 @@ mod tests {
         let mut key = key;
         key.l4_protocol = 58;
 
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-dynamic-v3");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(prefix_len);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            prefix_len,
-            Some(MacAddr::broadcast()),
-        );
         add_ct6_icmp_entry(&skel.maps.nat6_timer_map, &key, src, dst, 443);
 
         let quoted = build_quoted_ipv6_tcp(dst, src, 443, CLIENT_PORT);
@@ -396,7 +452,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = skel.progs.tc_nat_wan_egress.test_run(input).expect("test_run failed");
+        let result = skel.progs.tc_nat_wan_egress_v6.test_run(input).expect("test_run failed");
         assert_eq!(
             result.return_value as i32, -1,
             "egress ICMP error should return TC_ACT_UNSPEC(-1)"
@@ -446,21 +502,17 @@ mod tests {
         let mut key = key;
         key.l4_protocol = 58;
 
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-dynamic-v3");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(prefix_len);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            prefix_len,
-            Some(MacAddr::broadcast()),
-        );
         add_ct6_icmp_entry(&skel.maps.nat6_timer_map, &key, src, dst, 443);
 
         let quoted = build_quoted_ipv6_tcp(wan_src, dst, CLIENT_PORT, 443);
@@ -475,7 +527,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = skel.progs.tc_nat_wan_ingress.test_run(input).expect("test_run failed");
+        let result = skel.progs.tc_nat_wan_ingress_v6.test_run(input).expect("test_run failed");
         assert_eq!(result.return_value as i32, 0, "ingress ICMP error should return TC_ACT_OK(0)");
 
         let pkt_out = PacketHeaders::from_ethernet_slice(&packet_out).expect("parse output");
@@ -524,21 +576,17 @@ mod tests {
         let new_key = timer_key_for(new_src, CLIENT_PORT, prefix_len);
         assert_eq!(key, new_key, "test setup must keep the same dynamic NAT key",);
 
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-dynamic-v3");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(prefix_len);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            prefix_len,
-            Some(MacAddr::broadcast()),
-        );
 
         let mut value = Nat6TimerValue {
             server_status: 1,
@@ -566,7 +614,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = skel.progs.tc_nat_wan_egress.test_run(input).expect("test_run failed");
+        let result = skel.progs.tc_nat_wan_egress_v6.test_run(input).expect("test_run failed");
         assert_eq!(result.return_value as i32, -1, "egress should return TC_ACT_UNSPEC(-1)");
 
         let ct_value = lookup_ct6_entry(&skel.maps.nat6_timer_map, &new_key);
@@ -599,21 +647,17 @@ mod tests {
         let new_key = timer_key_for(new_src, CLIENT_PORT, prefix_len);
         assert_eq!(key, new_key, "test setup must keep the same dynamic NAT key",);
 
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-dynamic-v3");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(prefix_len);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            prefix_len,
-            Some(MacAddr::broadcast()),
-        );
 
         add_ct6_entry(&skel.maps.nat6_timer_map, &key, old_src, old_remote, 443);
 
@@ -628,7 +672,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = skel.progs.tc_nat_wan_egress.test_run(input).expect("test_run failed");
+        let result = skel.progs.tc_nat_wan_egress_v6.test_run(input).expect("test_run failed");
         assert_eq!(result.return_value as i32, -1, "egress should return TC_ACT_UNSPEC(-1)");
 
         let ct_value = lookup_ct6_entry(&skel.maps.nat6_timer_map, &new_key);
@@ -661,21 +705,17 @@ mod tests {
         let new_key = timer_key_for(new_src, CLIENT_PORT, prefix_len);
         assert_eq!(key, new_key, "test setup must keep the same dynamic NAT key",);
 
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-dynamic-v3");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(prefix_len);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            prefix_len,
-            Some(MacAddr::broadcast()),
-        );
 
         add_ct6_entry(&skel.maps.nat6_timer_map, &key, old_src, old_remote, 443);
 
@@ -689,7 +729,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = skel.progs.tc_nat_wan_egress.test_run(input).expect("test_run failed");
+        let result = skel.progs.tc_nat_wan_egress_v6.test_run(input).expect("test_run failed");
         assert_eq!(result.return_value as i32, -1, "egress should return TC_ACT_UNSPEC(-1)");
 
         let ct_value = lookup_ct6_entry(&skel.maps.nat6_timer_map, &new_key);

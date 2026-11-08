@@ -12,9 +12,13 @@ use std::{
 };
 
 use landscape_common::{
-    flow::{FlowMarkInfo, ip_mark::IpConfig, ip_mark::IpMarkInfo, mark::FlowMark},
+    flow::{
+        FlowMarkInfo,
+        ip_mark::{IpConfig, IpMarkInfo},
+        mark::{FlowMark, FlowMarkAction},
+    },
     net::MacAddr,
-    sys_service::route_service::RouteTargetInfo,
+    sys_service::route_service::{RouteTargetInfo, WanRouteTarget},
 };
 use libbpf_rs::{
     MapCore, MapFlags, ProgramInput,
@@ -28,24 +32,20 @@ use crate::{
         flow_wanip::create_inner_flow_match_map_v6, route::replace_wan_route_slots_v6_with_map,
     },
     tests::{
-        TestSkb, isolated_pin_root,
-        route::{
-            map_helper::{
-                LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE,
-                WAN_IFINDEX, WAN_ROUTE_TYPE, as_bytes, create_route6_cache_inner_map, gateway_addr,
-                insert_ip_mac_v6, insert_route6_lan_entry, local_addr, lookup_ip_mac_v6,
-                lookup_rt6_cache_value, put_rt6_cache_full, put_rt6_cache_value, remote_addr,
-                seed_flow_match_mac,
-            },
-            packet_builder::{simple_ipv4_tcp, simple_ipv6_tcp_syn},
+        TestSkb,
+        helper::map::{
+            LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE, WAN_IFINDEX,
+            WAN_ROUTE_TYPE, as_bytes, create_route6_cache_inner_map, gateway_addr,
+            insert_ip_mac_v6, insert_route6_lan_entry, local_addr, lookup_ip_mac_v6,
+            lookup_rt6_cache_value, normal_mark, put_rt6_cache_full, put_rt6_cache_value,
+            remote_addr, seed_flow_match_mac,
         },
+        isolated_pin_root,
+        pkt::{simple_ipv4_tcp, simple_ipv6_tcp_syn},
     },
 };
 
-pub(crate) mod tc_lan_ingress_route {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_lan_ingress_route.skel.rs"));
-}
-use tc_lan_ingress_route::TcLanIngressRouteSkel;
+use crate::skel::tc_lan_ingress_route::TcLanIngressRouteSkel;
 
 const RET_OK: i32 = 0;
 const RET_UNSPEC: i32 = -1;
@@ -77,10 +77,21 @@ fn lan_ctx() -> TestSkb {
 macro_rules! load_skel {
     ($pin:expr, $skel:ident) => {
         let pin_root = isolated_pin_root($pin);
-        let mut builder = tc_lan_ingress_route::TcLanIngressRouteSkelBuilder::default();
+        let mut builder =
+            crate::skel::tc_lan_ingress_route::TcLanIngressRouteSkelBuilder::default();
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = std::mem::MaybeUninit::uninit();
         let $skel = builder.open(&mut open_object).unwrap().load().unwrap();
+    };
+    ($pin:expr, $skel:ident, $l3_offset:expr) => {
+        let pin_root = isolated_pin_root($pin);
+        let mut builder =
+            crate::skel::tc_lan_ingress_route::TcLanIngressRouteSkelBuilder::default();
+        builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
+        let mut open_object = std::mem::MaybeUninit::uninit();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        open_skel.maps.rodata_data.as_deref_mut().unwrap().current_l3_offset = $l3_offset;
+        let $skel = open_skel.load().unwrap();
     };
 }
 
@@ -110,7 +121,7 @@ fn run_lan6_ingress(
 
 fn seed_flow_rule_under(skel: &TcLanIngressRouteSkel<'_>, flow_id: u32, dst: Ipv6Addr, mark: u32) {
     let rules = vec![IpMarkInfo {
-        mark: FlowMark::from(mark),
+        mark: FlowMark::from(mark as u16),
         cidr: IpConfig { ip: IpAddr::V6(dst), prefix: 128 },
         priority: 100,
     }];
@@ -124,20 +135,11 @@ fn seed_wan_slots(
     is_docker: bool,
     mac: Option<MacAddr>,
 ) {
-    let targets = [(
-        RouteTargetInfo {
-            weight: 0,
-            ifindex,
-            mac,
-            default_route: false,
-            is_docker,
-            iface_name: "test-wan".to_string(),
-            iface_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            gateway_ip: IpAddr::V6(gateway_addr()),
-            dev_only_nexthop: false,
-        },
-        1,
-    )];
+    let mut info = RouteTargetInfo::dummy(ifindex, "test-wan", IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+    info.mac = mac;
+    info.is_docker = is_docker;
+    info.gateway_ip = IpAddr::V6(gateway_addr());
+    let targets = [(WanRouteTarget::link(0, info), 1)];
     replace_wan_route_slots_v6_with_map(&skel.maps.rt6_slot_map, flow_id, &targets);
 }
 

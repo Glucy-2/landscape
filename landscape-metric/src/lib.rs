@@ -5,12 +5,13 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use landscape_common::concurrency::{spawn_task, task_label};
 use landscape_common::config::{MetricMode, MetricRuntimeConfig};
 use landscape_common::database::error::DbError;
-use landscape_common::event::{ConnectMessage, DnsMetricMessage};
+use landscape_common::metric::connect::ConnectMetric;
 use landscape_common::metric::connect::{
     ConnectGlobalStats, ConnectHistoryQueryParams, ConnectHistoryResponse, ConnectKey,
     ConnectMetricPoint, ConnectRealtimeStatus, IfaceRealtimeStat, IpHistoryStat, IpRealtimeStat,
     MetricResolution,
 };
+use landscape_common::metric::dns::DnsMetricEvent;
 use landscape_common::metric::dns::{
     DnsHistoryQueryParams, DnsHistoryResponse, DnsLightweightSummaryResponse,
     DnsSummaryQueryParams, DnsSummaryResponse,
@@ -87,8 +88,8 @@ async fn build_sink(
 pub struct MetricEngine {
     config: MetricRuntimeConfig,
     sink: Arc<dyn MetricSink>,
-    connect_tx: Option<mpsc::Sender<ConnectMessage>>,
-    dns_tx: Option<mpsc::Sender<DnsMetricMessage>>,
+    connect_tx: Option<mpsc::Sender<ConnectMetric>>,
+    dns_tx: Option<mpsc::Sender<DnsMetricEvent>>,
     shutdown: CancellationToken,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
     connect_writer_tx: Arc<Mutex<Option<workers::ConnectBatchTx>>>,
@@ -120,8 +121,8 @@ impl MetricEngine {
 
         let dns_window = if is_persistent { Some(DnsRecentWindow::new()) } else { None };
 
-        let (connect_tx, connect_rx) = mpsc::channel::<ConnectMessage>(agg::CHANNEL_CAPACITY);
-        let (dns_tx, dns_rx) = mpsc::channel::<DnsMetricMessage>(agg::CHANNEL_CAPACITY);
+        let (connect_tx, connect_rx) = mpsc::channel::<ConnectMetric>(agg::CHANNEL_CAPACITY);
+        let (dns_tx, dns_rx) = mpsc::channel::<DnsMetricEvent>(agg::CHANNEL_CAPACITY);
 
         if !matches!(mode, MetricMode::Off) {
             // connect/dns 各自的 sqlite 文件相互独立,拆成两条 writer 链路并行写;
@@ -234,11 +235,11 @@ impl MetricEngine {
         resolved_metric_mode(self.config.mode.clone())
     }
 
-    pub fn get_connect_msg_channel(&self) -> Option<mpsc::Sender<ConnectMessage>> {
+    pub fn get_connect_msg_channel(&self) -> Option<mpsc::Sender<ConnectMetric>> {
         self.connect_tx.clone()
     }
 
-    pub fn get_dns_msg_channel(&self) -> Option<mpsc::Sender<DnsMetricMessage>> {
+    pub fn get_dns_msg_channel(&self) -> Option<mpsc::Sender<DnsMetricEvent>> {
         self.dns_tx.clone()
     }
 
@@ -474,12 +475,8 @@ mod tests {
         let tx = engine.get_connect_msg_channel().unwrap();
         let now_ms = now_ms();
 
-        tx.send(ConnectMessage::Metric(connect_metric(1, now_ms - 3_000, now_ms - 2_000, 100)))
-            .await
-            .unwrap();
-        tx.send(ConnectMessage::Metric(connect_metric(2, now_ms - 2_000, now_ms - 1_000, 200)))
-            .await
-            .unwrap();
+        tx.send(connect_metric(1, now_ms - 3_000, now_ms - 2_000, 100)).await.unwrap();
+        tx.send(connect_metric(2, now_ms - 2_000, now_ms - 1_000, 200)).await.unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -528,12 +525,8 @@ mod tests {
         let now_ms = now_ms();
         let key = ConnectKey { create_time: 1_000 * 1_000_000, cpu_id: 1 };
 
-        tx.send(ConnectMessage::Metric(connect_metric(1, 1_000, now_ms - 4_000, 100)))
-            .await
-            .unwrap();
-        tx.send(ConnectMessage::Metric(connect_metric(1, 1_000, now_ms - 3_000, 200)))
-            .await
-            .unwrap();
+        tx.send(connect_metric(1, 1_000, now_ms - 4_000, 100)).await.unwrap();
+        tx.send(connect_metric(1, 1_000, now_ms - 3_000, 200)).await.unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -566,9 +559,7 @@ mod tests {
             MetricEngine::new(PathBuf::new(), test_config(MetricMode::Memory)).await.unwrap();
         let tx = engine.get_connect_msg_channel().unwrap();
         let now_ms = now_ms();
-        tx.send(ConnectMessage::Metric(connect_metric(1, 1_000, now_ms - 1_000, 100)))
-            .await
-            .unwrap();
+        tx.send(connect_metric(1, 1_000, now_ms - 1_000, 100)).await.unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -595,20 +586,22 @@ mod tests {
     #[cfg(feature = "metric-persistent")]
     mod persistent {
         use super::*;
-        use landscape_common::metric::dns::DnsOutcome;
+        use hickory_proto::op::ResponseCode;
+        use hickory_proto::rr::RecordType;
+        use landscape_common::metric::dns::{DnsMetricEvent, DnsOutcome};
 
-        fn dns_metric(report_time: u64) -> DnsMetricMessage {
-            DnsMetricMessage::Metric(landscape_common::metric::dns::DnsMetric {
+        fn dns_metric(report_time: u64) -> DnsMetricEvent {
+            DnsMetricEvent {
                 flow_id: 1,
-                domain: "example.com".to_string(),
-                query_type: "A".to_string(),
-                response_code: "NOERROR".to_string(),
+                domain: Arc::from("example.com"),
+                query_type: RecordType::A,
+                response_code: ResponseCode::NoError,
                 status: DnsOutcome::Normal,
                 report_time,
                 duration_ms: 12,
                 src_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 answers: Vec::new(),
-            })
+            }
         }
 
         #[tokio::test]
@@ -625,10 +618,10 @@ mod tests {
 
             let mut active = connect_metric(1, 1_000, minute_start - 2_000, 100);
             active.status = ConnectStatusType::Active.into();
-            tx.send(ConnectMessage::Metric(active)).await.unwrap();
+            tx.send(active).await.unwrap();
             let mut closed = connect_metric(1, 1_000, minute_start - 1_000, 200);
             closed.status = ConnectStatusType::Disabled.into();
-            tx.send(ConnectMessage::Metric(closed)).await.unwrap();
+            tx.send(closed).await.unwrap();
 
             let key = ConnectKey { create_time: 1_000 * 1_000_000, cpu_id: 1 };
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -725,7 +718,7 @@ mod tests {
             let tx = engine.get_connect_msg_channel().unwrap();
             let mut closed = connect_metric(1, 1_000, now_ms - 1_000, 200);
             closed.status = ConnectStatusType::Disabled.into();
-            tx.send(ConnectMessage::Metric(closed)).await.unwrap();
+            tx.send(closed).await.unwrap();
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
@@ -824,7 +817,7 @@ mod tests {
             let tx = engine.get_connect_msg_channel().unwrap();
             let mut active = connect_metric(1, 1_000, now_ms - 1_000, 200);
             active.status = ConnectStatusType::Active.into();
-            tx.send(ConnectMessage::Metric(active)).await.unwrap();
+            tx.send(active).await.unwrap();
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
@@ -930,9 +923,7 @@ mod tests {
                     .unwrap();
             let tx = engine.get_connect_msg_channel().unwrap();
             let now_ms = now_ms();
-            tx.send(ConnectMessage::Metric(connect_metric(1, 1_000, now_ms - 1_000, 100)))
-                .await
-                .unwrap();
+            tx.send(connect_metric(1, 1_000, now_ms - 1_000, 100)).await.unwrap();
 
             // 回归:shutdown 不得等待外部仍持活的 Sender 释放。修复前 drain 循环
             // 会因通道永不完全关闭而永久阻塞(store 自身字段亦持有 sender clone)。
@@ -962,8 +953,7 @@ mod tests {
         }
 
         fn window_metric(report_time: u64) -> landscape_common::metric::dns::DnsMetric {
-            let DnsMetricMessage::Metric(metric) = dns_metric(report_time);
-            metric
+            dns_metric(report_time).into_metric()
         }
 
         #[tokio::test]

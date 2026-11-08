@@ -7,10 +7,7 @@ use crate::bpf_error::LdEbpfResult;
 use crate::landscape::{OwnedOpenObject, TcHookProxy, pin_and_reuse_map};
 use crate::runtime::EbpfRuntime;
 
-mod tc_lan_ingress_route_skel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_lan_ingress_route.skel.rs"));
-}
-use tc_lan_ingress_route_skel::{TcLanIngressRouteSkel, TcLanIngressRouteSkelBuilder};
+use crate::skel::tc_lan_ingress_route::{TcLanIngressRouteSkel, TcLanIngressRouteSkelBuilder};
 
 pub struct TcLanRouteHandle {
     _intro_skel: TcLanIngressRouteSkel<'static>,
@@ -35,7 +32,6 @@ pub fn init_tc_lan_route(
     xdp_handoff_enabled: bool,
 ) -> LdEbpfResult<TcLanRouteHandle> {
     let paths = &rt.paths;
-    rt.tc.ensure_roots(ifindex, has_eth_header)?;
 
     let l3_offset: u32 = if has_eth_header { 14 } else { 0 };
 

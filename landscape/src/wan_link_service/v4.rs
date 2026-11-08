@@ -6,14 +6,15 @@ use landscape_common::LANDSCAPE_DEFAULE_DHCP_V4_CLIENT_PORT;
 use landscape_common::args::LAND_HOSTNAME;
 use landscape_common::dev::LandscapeInterface;
 use landscape_common::service::{ServiceHandle, ServiceStatus};
-use landscape_common::sys_service::route_service::{LanRouteInfo, LanRouteMode, RouteTargetInfo};
+use landscape_common::sys_service::route_service::{
+    LanRouteInfo, LanRouteMode, RouteTargetInfo, WanRouteTarget,
+};
 use landscape_common::wan_link::{
     LinkStateHandle, RuntimeWanLinkConfig, RuntimeWanLinkKind, SessionIface, V4Runtime,
     WanLinkV4Model, WanV4Lease, swap_if_changed,
 };
-use landscape_common::wan_service::addr_binding::WanAddrBinding;
 use landscape_common::wan_service::pppd::PPPDConfig;
-use landscape_common::wan_service::pppoe::PppoeDataplane;
+use landscape_ebpf::chain::wan_link::WanLinkDataplane;
 
 use crate::sys_service::route::IpRouteService;
 
@@ -27,13 +28,13 @@ pub(super) async fn run(
     runtime: RuntimeWanLinkConfig,
     service_status: ServiceHandle,
     route_service: IpRouteService,
-    addr_binding: Arc<dyn WanAddrBinding>,
-    pppoe_dataplane: Arc<dyn PppoeDataplane>,
+    chain_dataplane: Arc<WanLinkDataplane>,
     session: Option<LinkStateHandle>,
     v4_runtime: Arc<ArcSwap<V4Runtime>>,
 ) {
     let attach_iface_name = runtime.attach_iface_name.clone();
     let link_id = runtime.id;
+    let chain_id = runtime.link_chain_id;
     let v4_enable = runtime.v4.enable;
     let v4_model = runtime.v4.model.clone();
     let pd_enable = runtime.pd.enable;
@@ -60,13 +61,14 @@ pub(super) async fn run(
                     run_static_v4(
                         iface,
                         link_id,
+                        chain_id,
                         ipv4,
                         ipv4_mask,
                         default_router,
                         default_router_ip,
                         service_status,
                         route_service,
-                        addr_binding,
+                        chain_dataplane,
                         session,
                         v4_runtime,
                     )
@@ -76,11 +78,12 @@ pub(super) async fn run(
                     run_dhcp_v4(
                         iface,
                         link_id,
+                        chain_id,
                         hostname,
                         default_router,
                         service_status,
                         route_service,
-                        addr_binding,
+                        chain_dataplane,
                         session,
                         v4_runtime,
                     )
@@ -105,8 +108,9 @@ pub(super) async fn run(
                 pppd_config,
                 service_status,
                 route_service,
-                addr_binding,
+                chain_dataplane,
                 link_id,
+                chain_id,
                 session,
                 v4_runtime,
             )
@@ -126,6 +130,7 @@ pub(super) async fn run(
             run_pppoe_native(
                 iface,
                 link_id,
+                chain_id,
                 username,
                 password,
                 requested_mru,
@@ -135,7 +140,7 @@ pub(super) async fn run(
                 default_router,
                 service_status,
                 route_service,
-                pppoe_dataplane,
+                chain_dataplane,
                 session,
                 v4_runtime,
             )
@@ -173,13 +178,14 @@ async fn run_idle_until_stopped(
 async fn run_static_v4(
     iface: LandscapeInterface,
     link_id: uuid::Uuid,
+    chain_id: u16,
     ipv4: Option<Ipv4Addr>,
     ipv4_mask: Option<u8>,
     default_router: bool,
     default_router_ip: Option<Ipv4Addr>,
     service_status: ServiceHandle,
     route_service: IpRouteService,
-    addr_binding: Arc<dyn WanAddrBinding>,
+    chain_dataplane: Arc<WanLinkDataplane>,
     session: Option<LinkStateHandle>,
     v4_runtime: Arc<ArcSwap<V4Runtime>>,
 ) {
@@ -195,7 +201,7 @@ async fn run_static_v4(
     let _ = std::process::Command::new("ip")
         .args(["addr", "add", &format!("{}/{}", ipv4, ipv4_mask), "dev", &iface_name])
         .output();
-    addr_binding.bind_ipv4(iface.index, ipv4, default_router_ip, ipv4_mask, iface.mac);
+    chain_dataplane.bind_wan_ipv4(iface.index, ipv4, default_router_ip, ipv4_mask, iface.mac);
 
     let lan_info = LanRouteInfo {
         ifindex: iface.index,
@@ -216,18 +222,22 @@ async fn run_static_v4(
             tracing::info!("setting default route: {:?}", default_router_ip);
         }
 
-        let info = RouteTargetInfo {
-            ifindex: iface.index,
-            weight: 1,
-            mac: iface.mac,
-            is_docker: false,
-            iface_name: iface_name.clone(),
-            iface_ip: IpAddr::V4(ipv4),
-            default_route: default_router,
-            gateway_ip: IpAddr::V4(default_router_ip),
-            dev_only_nexthop: false,
-        };
-        route_service.insert_ipv4_link_route(link_id, info).await;
+        route_service
+            .insert_ipv4_link_route(
+                link_id,
+                WanRouteTarget::link(
+                    chain_id,
+                    RouteTargetInfo::new_gateway_v4(
+                        iface.index,
+                        &iface_name,
+                        iface.mac,
+                        ipv4,
+                        default_router_ip,
+                        default_router,
+                    ),
+                ),
+            )
+            .await;
     }
 
     if let Some(session) = session.as_ref() {
@@ -251,7 +261,7 @@ async fn run_static_v4(
 
     route_service.remove_ipv4_link_route(link_id).await;
     route_service.remove_ipv4_lan_route(&iface_name).await;
-    addr_binding.unbind_ipv4(iface.index);
+    chain_dataplane.unbind_wan_ipv4();
     swap_if_changed(&v4_runtime, V4Runtime::Stopped);
     service_status.just_change_status(ServiceStatus::Stop);
 }
@@ -260,11 +270,12 @@ async fn run_static_v4(
 async fn run_dhcp_v4(
     iface: LandscapeInterface,
     link_id: uuid::Uuid,
+    chain_id: u16,
     hostname: Option<String>,
     default_router: bool,
     service_status: ServiceHandle,
     route_service: IpRouteService,
-    addr_binding: Arc<dyn WanAddrBinding>,
+    chain_dataplane: Arc<WanLinkDataplane>,
     session: Option<LinkStateHandle>,
     v4_runtime: Arc<ArcSwap<V4Runtime>>,
 ) {
@@ -272,6 +283,7 @@ async fn run_dhcp_v4(
         let hostname = hostname.filter(|h| !h.is_empty()).unwrap_or_else(|| LAND_HOSTNAME.clone());
         let config = crate::wan_service::dhcpv4_client::DhcpV4ClientServiceRuntimeConfig {
             link_id,
+            chain_id,
             ifindex: iface.index,
             iface_name: iface.name,
             mac_addr,
@@ -281,7 +293,7 @@ async fn run_dhcp_v4(
         };
         let services = crate::wan_service::dhcpv4_client::DhcpV4ClientServices {
             route_service,
-            addr_binding,
+            chain_dataplane,
             session,
             runtime: v4_runtime,
         };
@@ -296,6 +308,7 @@ async fn run_dhcp_v4(
 async fn run_pppoe_native(
     iface: LandscapeInterface,
     link_id: uuid::Uuid,
+    chain_id: u16,
     username: String,
     password: String,
     requested_mru: u16,
@@ -305,7 +318,7 @@ async fn run_pppoe_native(
     default_router: bool,
     service_status: ServiceHandle,
     route_service: IpRouteService,
-    pppoe_dataplane: Arc<dyn PppoeDataplane>,
+    chain_dataplane: Arc<WanLinkDataplane>,
     session: Option<LinkStateHandle>,
     v4_runtime: Arc<ArcSwap<V4Runtime>>,
 ) {
@@ -321,13 +334,14 @@ async fn run_pppoe_native(
             requested_mru,
             ac_name,
         );
+        config.chain_id = chain_id;
         config.lcp_echo_interval = lcp_echo_interval.map(u64::from);
         config.redial_backoff_base_secs = redial_backoff_base_secs;
         crate::wan_service::pppoe_client::run(
             config,
             service_status,
             route_service,
-            pppoe_dataplane,
+            chain_dataplane,
             session,
             v4_runtime,
         )

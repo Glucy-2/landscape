@@ -56,6 +56,9 @@ pub enum PppoeRuntime {
         #[cfg_attr(feature = "openapi", schema(value_type = String))]
         peer_ip: Ipv4Addr,
         session_id: u16,
+        /// Unix milliseconds when this session was established.
+        #[cfg_attr(feature = "openapi", schema(value_type = f64))]
+        connected_at: u64,
     },
     RedialBackoff {
         retry_count: u64,
@@ -85,6 +88,9 @@ pub enum PppdRuntime {
         local_ip: Ipv4Addr,
         #[cfg_attr(feature = "openapi", schema(value_type = String))]
         peer_ip: Ipv4Addr,
+        /// Unix milliseconds when this session was established.
+        #[cfg_attr(feature = "openapi", schema(value_type = f64))]
+        connected_at: u64,
     },
     RestartBackoff {
         failure_count: u32,
@@ -101,6 +107,11 @@ pub struct PdLease {
     pub prefix_len: u8,
     pub valid_secs: u32,
     pub preferred_secs: u32,
+    #[cfg_attr(
+        feature = "openapi",
+        schema(required = true, nullable = true, value_type = Option<String>)
+    )]
+    pub wan_ip: Option<Ipv6Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -176,7 +187,8 @@ impl From<DhcpV4Runtime> for V4Runtime {
 pub struct WanLinkSectionsStatus {
     v4: Arc<ArcSwap<V4Runtime>>,
     pd: Arc<ArcSwap<PdRuntime>>,
-    nat: Arc<ArcSwap<ServiceStatus>>,
+    nat4: Arc<ArcSwap<ServiceStatus>>,
+    nat6: Arc<ArcSwap<ServiceStatus>>,
     mss: Arc<ArcSwap<ServiceStatus>>,
     firewall: Arc<ArcSwap<ServiceStatus>>,
     health_check: Arc<ArcSwap<HealthCheckRuntime>>,
@@ -211,12 +223,28 @@ impl WanLinkSectionsStatus {
         self.health_check.clone()
     }
 
-    pub fn set_nat(&self, v: ServiceStatus) {
-        swap_if_changed(&self.nat, v);
+    pub fn set_nat4(&self, v: ServiceStatus) {
+        swap_if_changed(&self.nat4, v);
     }
 
-    pub fn nat_slot(&self) -> Arc<ArcSwap<ServiceStatus>> {
-        self.nat.clone()
+    pub fn nat4_slot(&self) -> Arc<ArcSwap<ServiceStatus>> {
+        self.nat4.clone()
+    }
+
+    pub fn nat4(&self) -> ServiceStatus {
+        (**self.nat4.load()).clone()
+    }
+
+    pub fn set_nat6(&self, v: ServiceStatus) {
+        swap_if_changed(&self.nat6, v);
+    }
+
+    pub fn nat6_slot(&self) -> Arc<ArcSwap<ServiceStatus>> {
+        self.nat6.clone()
+    }
+
+    pub fn nat6(&self) -> ServiceStatus {
+        (**self.nat6.load()).clone()
     }
 
     pub fn mss_slot(&self) -> Arc<ArcSwap<ServiceStatus>> {
@@ -225,10 +253,6 @@ impl WanLinkSectionsStatus {
 
     pub fn firewall_slot(&self) -> Arc<ArcSwap<ServiceStatus>> {
         self.firewall.clone()
-    }
-
-    pub fn nat(&self) -> ServiceStatus {
-        (**self.nat.load()).clone()
     }
 
     pub fn set_mss(&self, v: ServiceStatus) {
@@ -259,7 +283,8 @@ impl WanLinkSectionsStatus {
         WanLinkSectionsSnapshot {
             v4: self.v4(),
             pd: self.pd(),
-            nat: self.nat(),
+            nat4: self.nat4(),
+            nat6: self.nat6(),
             mss: self.mss(),
             firewall: self.firewall(),
             health_check: self.health_check(),
@@ -272,7 +297,8 @@ impl WanLinkSectionsStatus {
 pub struct WanLinkSectionsSnapshot {
     pub v4: V4Runtime,
     pub pd: PdRuntime,
-    pub nat: ServiceStatus,
+    pub nat4: ServiceStatus,
+    pub nat6: ServiceStatus,
     pub mss: ServiceStatus,
     pub firewall: ServiceStatus,
     pub health_check: HealthCheckRuntime,

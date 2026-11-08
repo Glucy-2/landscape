@@ -9,16 +9,19 @@ use landscape_common::net_proto::udp::dhcp::{
     Decodable, Decoder, Encodable, Encoder, get_solicit_options,
     v6::{self, DhcpOption, DhcpOptions, Message, OptionCode},
 };
+use landscape_ebpf::chain::wan_link::WanLinkDataplane;
 
 use arc_swap::ArcSwap;
 use socket2::{Domain, Protocol, Type};
 use tokio::{net::UdpSocket, time::Instant};
 use uuid::Uuid;
 
+use crate::netlink::address::get_existing_linklocal;
 use crate::{
-    netlink::ipv6::{del_iface_ip, set_iface_ip},
+    netlink::ipv6::{del_iface_ip, deprecate_iface_ip, set_iface_ip},
     sys_service::route::IpRouteService,
 };
+use landscape_common::flow::mark::{MarkType, SocketMark};
 
 use landscape_common::{
     LANDSCAPE_DEFAULE_DHCP_V6_SERVER_PORT,
@@ -27,14 +30,14 @@ use landscape_common::{
     service::{ServiceHandle, ServiceStatus},
     utils::time::get_f64_timestamp,
     wan_link::runtime_status::{PdLease, PdRuntime, swap_if_changed},
-    wan_service::addr_binding::WanAddrBinding,
+    wan_link::{LinkStateHandle, WanV6Prefix},
     wan_service::ipv6_pd::LDIAPrefix,
 };
 use landscape_common::{
-    concurrency::{spawn_task, task_label},
+    concurrency::task_label,
     event::hub::IAPrefixEvent,
     net::MacAddr,
-    sys_service::route_service::RouteTargetInfo,
+    sys_service::route_service::{RouteTargetInfo, WanRouteTarget},
 };
 use landscape_core::pd_prefix::IAPrefixMap;
 
@@ -42,6 +45,11 @@ pub const IPV6_TIMEOUT_DEFAULT_DURACTION: u64 = 10;
 pub const IPV6_TIMEOUT_RENEW_DURACTION: u64 = 10;
 pub const IPV6_TIMEOUT_REBIND_DURACTION: u64 = 20;
 const MAX_CONNECT_RETRY_BACKOFF_SECS: u64 = 10 * 60;
+
+/// How long a replaced PD /128 stays around (deprecated) so in-flight flows
+/// can drain. Capped by the old prefix's remaining valid lifetime; the kernel
+/// removes it when this lifetime expires.
+const PD_PREFIX_RETIRE_GRACE: Duration = Duration::from_secs(5 * 60);
 
 pub const IPV6_T1_DEFAULT: u64 = 60 * 60 * 12;
 pub const IPV6_T2_DEFAULT: u64 = (IPV6_T1_DEFAULT * 8) / 5; // IPV6_T1_DEFAULT * 1.6
@@ -200,6 +208,21 @@ impl IpV6PdState {
     }
 }
 
+fn state_label(status: &IpV6PdState) -> &'static str {
+    match status {
+        IpV6PdState::Solicit { .. } => "Solicit",
+        IpV6PdState::Request { .. } => "Request",
+        IpV6PdState::Bound { .. } => "Bound",
+        IpV6PdState::Confirm => "Confirm",
+        IpV6PdState::Renew { .. } => "Renew",
+        IpV6PdState::WaitToRebind { .. } => "WaitToRebind",
+        IpV6PdState::Rebind { .. } => "Rebind",
+        IpV6PdState::Release { .. } => "Release",
+        IpV6PdState::Decline => "Decline",
+        IpV6PdState::Stop => "Stop",
+    }
+}
+
 fn gen_client_id(config_mac: MacAddr) -> Vec<u8> {
     let mut result = Vec::with_capacity(10);
     result.extend_from_slice(&[0x00, 0x03, 0x00, 0x01]);
@@ -207,16 +230,54 @@ fn gen_client_id(config_mac: MacAddr) -> Vec<u8> {
     result
 }
 
-fn create_pd_socket(socket_addr: &SocketAddr, iface_name: &[u8]) -> std::io::Result<UdpSocket> {
+/// Re-bind the session's IPv6CP link-local if anything (iface reset,
+/// DAD conflict, an external manager) removed it; without it the socket
+/// has no source address and the sends fail. Verified by read-back.
+fn ensure_session_linklocal(iface_name: &str, session_ll: Option<Ipv6Addr>) -> bool {
+    let Some(ll) = session_ll else { return true };
+    if get_existing_linklocal(iface_name).as_ref() == Some(&ll) {
+        return true;
+    }
+    tracing::warn!(iface = iface_name, linklocal = %ll, "session link-local missing; force re-binding");
+    let _ = std::process::Command::new("ip")
+        .args(["-6", "addr", "replace", &format!("{}/64", ll), "dev", iface_name])
+        .output();
+    match get_existing_linklocal(iface_name) {
+        Some(current) if current == ll => true,
+        current => {
+            tracing::error!(
+                iface = iface_name,
+                expected = %ll,
+                found = ?current,
+                "session link-local force-bind failed; DHCPv6 has no stable source"
+            );
+            false
+        }
+    }
+}
+
+fn create_pd_socket(
+    socket_addr: &SocketAddr,
+    iface_name: &[u8],
+    chain_id: u16,
+) -> std::io::Result<UdpSocket> {
     let socket = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_only_v6(true)?;
     socket.set_reuse_address(true)?;
     if let Err(err) = socket.set_reuse_port(true) {
         tracing::warn!("set_reuse_port failed (non-fatal): {err:?}");
     }
+    // Scope the bind to this WAN device before claiming the wildcard port.
+    // Otherwise a DHCPv6 client bound to another interface (e.g. dhcpcd on
+    // the management NIC) makes bind() return EADDRINUSE.
+    socket.bind_device(Some(iface_name))?;
     socket.bind(&(*socket_addr).into())?;
     socket.set_nonblocking(true)?;
-    socket.bind_device(Some(iface_name))?;
+    // All sends (Solicit / Renew / Release) carry the session's chain in
+    // the HostDirect mark: the WAN egress entry hands the packet to the
+    // link's chain root directly and every policy stage self-skips on
+    // this mark, so the control plane rides the PPP terminal unfiltered.
+    socket.set_mark(u32::from(SocketMark::new(MarkType::HostDirect { chain_id }, 0)))?;
     UdpSocket::from_std(socket.into())
 }
 
@@ -264,8 +325,13 @@ fn gen_release(client_id: &[u8], service_id: Vec<u8>, iapd: v6::IAPD) -> Option<
 #[allow(clippy::too_many_arguments)]
 pub async fn dhcp_v6_pd_client(
     link_id: Uuid,
+    chain_id: u16,
     iface_name: String,
     ifindex: u32,
+    // session's IPv6CP link-local (SessionIface::v6_linklocal); kept
+    // bound on the iface as a stable DHCPv6 source (chain steering is
+    // the HostDirect SO_MARK above, not the address)
+    session_ll: Option<Ipv6Addr>,
     // for ebpf map setting
     mac_addr: Option<MacAddr>,
     // for pd request
@@ -275,11 +341,12 @@ pub async fn dhcp_v6_pd_client(
     service_status: ServiceHandle,
     wan_route_info: RouteTargetInfo,
     route_service: IpRouteService,
-    addr_binding: Arc<dyn WanAddrBinding>,
+    chain_dataplane: Arc<WanLinkDataplane>,
     prefix_map: IAPrefixMap,
     shared_wan_iid: Arc<u64>,
     prefix_sender: IAPrefixEventSender,
     pd_runtime: Arc<ArcSwap<PdRuntime>>,
+    link_state: LinkStateHandle,
 ) {
     let client_id = gen_client_id(config_mac);
     service_status.just_change_status(ServiceStatus::Staring);
@@ -292,13 +359,20 @@ pub async fn dhcp_v6_pd_client(
     // }
 
     tracing::info!("DHCP V6 Client Staring");
-    // landscape_ebpf::maps::add_expose_port(client_port);
+
     let socket_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), client_port);
 
-    let socket = match create_pd_socket(&socket_addr, iface_name.as_bytes()) {
+    let socket = match create_pd_socket(&socket_addr, iface_name.as_bytes(), chain_id) {
         Ok(socket) => socket,
         Err(e) => {
-            tracing::error!("failed to create DHCPv6 PD socket on {}: {e:?}", iface_name);
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                tracing::error!(
+                    "failed to bind DHCPv6 PD socket on {iface_name}:{client_port}: UDP port already in use; \
+                     another DHCPv6 client may hold it (check: ss -lunp 'sport = :{client_port}')"
+                );
+            } else {
+                tracing::error!("failed to create DHCPv6 PD socket on {}: {e:?}", iface_name);
+            }
             service_status.just_change_status(ServiceStatus::Failed);
             swap_if_changed(&pd_runtime, PdRuntime::Stopped);
             return;
@@ -312,7 +386,7 @@ pub async fn dhcp_v6_pd_client(
     let (message_tx, mut message_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
 
     // 接收数据
-    spawn_task(task_label::task::WAN_IPV6PD_CLIENT_RENEW, async move {
+    service_status.spawn_task(task_label::task::WAN_IPV6PD_CLIENT_RENEW, async move {
         // 超时重发定时器
 
         let mut buf = vec![0u8; 65535];
@@ -354,15 +428,18 @@ pub async fn dhcp_v6_pd_client(
 
     let mut active_send = Box::pin(tokio::time::sleep(Duration::from_secs(0)));
 
+    let mut current_wan_addr: Option<Ipv6Addr> = None;
     let mut status = IpV6PdState::init_status();
-    swap_if_changed(&pd_runtime, pd_runtime_projection(&status));
+    swap_if_changed(&pd_runtime, pd_runtime_projection(&status, current_wan_addr));
     #[cfg(debug_assertions)]
     let time = tokio::time::Instant::now();
-    let mut current_wan_addr: Option<Ipv6Addr> = None;
 
     let stop_token = service_status.stop_token();
     let mut cleaned_up = false;
+    ensure_session_linklocal(&iface_name, session_ll);
     loop {
+        let status_before = state_label(&status);
+
         tokio::select! {
             // 超时激发重发
             _ = active_send.as_mut() => {
@@ -370,51 +447,60 @@ pub async fn dhcp_v6_pd_client(
                 {
                     tracing::error!("Timeout active at: {:?}",  time.elapsed());
                 }
-                if timeout_times > 4 {
+                tracing::info!(
+                    iface = iface_name,
+                    %link_id,
+                    state = status_before,
+                    timeout_times,
+                    prefix_remaining_secs = ?active_prefix_remaining(&status).map(|d| d.as_secs_f64()),
+                    "DHCPv6 PD timer fired"
+                );
+                if timeout_times > 4 && matches!(status, IpV6PdState::Solicit { .. }) {
                     // 如果当前状态是 Solicit 并且 超时 4 次 就退出
-                    if matches!(status, IpV6PdState::Solicit { .. }) {
-                        connect_failure_count = connect_failure_count.saturating_add(1);
-                        let backoff = calc_connect_retry_backoff_secs(connect_failure_count);
-                        tracing::warn!(
-                            "DHCPv6 solicit timeout exceeded limit, retry in {}s (failure_count={})",
-                            backoff,
-                            connect_failure_count
-                        );
-                        status = IpV6PdState::init_status();
-                        timeout_times = 1;
-                        active_send
-                            .as_mut()
-                            .set(tokio::time::sleep(Duration::from_secs(backoff)));
-                        continue;
-                    // } else {
-                    //     timeout_times = 0;
-                    //     // current_timeout_time = IPV6_TIMEOUT_DEFAULT_DURACTION;
-                    //     status = IpV6PdState::init_status();
-                    //     tracing::error!("Start from Solicit: {:#?}", status);
+                    connect_failure_count = connect_failure_count.saturating_add(1);
+                    let backoff = calc_connect_retry_backoff_secs(connect_failure_count);
+                    tracing::warn!(
+                        "DHCPv6 solicit timeout exceeded limit, retry in {}s (failure_count={})",
+                        backoff,
+                        connect_failure_count
+                    );
+                    status = IpV6PdState::init_status();
+                    timeout_times = 1;
+                    active_send
+                        .as_mut()
+                        .set(tokio::time::sleep(Duration::from_secs(backoff)));
+                } else {
+                    ensure_session_linklocal(&iface_name, session_ll);
+                    let send_outcome = send_current_status_packet(&client_id, &send_socket, &mut status).await;
+                    if send_outcome.prefix_expired {
+                        clear_active_pd_prefix(
+                            link_id,
+                            &iface_name,
+                            &route_service,
+                            chain_dataplane.as_ref(),
+                            &prefix_map,
+                            &prefix_sender,
+                            &mut current_wan_addr,
+                            &link_state,
+                        )
+                        .await;
                     }
+                    if send_outcome.reset_timeout {
+                        timeout_times = 0;
+                    }
+                    let (next_times, next_timeout) =
+                        get_status_timeout_config(&status, timeout_times, active_send.as_mut());
+                    timeout_times = next_times;
+                    tracing::debug!(
+                        iface = iface_name,
+                        %link_id,
+                        state = state_label(&status),
+                        timeout_times,
+                        next_timeout_secs = next_timeout.as_secs_f64(),
+                        "DHCPv6 PD next timer armed"
+                    );
+                    swap_if_changed(&pd_runtime, pd_runtime_projection(&status, current_wan_addr));
                 }
-
-                let send_outcome = send_current_status_packet(&client_id, &send_socket, &mut status).await;
-                if send_outcome.prefix_expired {
-                    clear_active_pd_prefix(
-                        link_id,
-                        &iface_name,
-                        ifindex,
-                        &route_service,
-                        addr_binding.as_ref(),
-                        &prefix_map,
-                        &prefix_sender,
-                        &mut current_wan_addr,
-                    )
-                    .await;
-                }
-                if send_outcome.reset_timeout {
-                    timeout_times = 0;
-                }
-                timeout_times = get_status_timeout_config(&status, timeout_times, active_send.as_mut());
-                swap_if_changed(&pd_runtime, pd_runtime_projection(&status));
-                // active_send.as_mut().set(tokio::time::sleep(Duration::from_secs(current_timeout_time * timeout_times)));
-                // timeout_times += 1;
             },
             message_result = message_rx.recv() => {
                 // 处理接收到的数据包
@@ -422,6 +508,7 @@ pub async fn dhcp_v6_pd_client(
                     Some(data) => {
                         let need_reset_time = handle_packet(
                             link_id,
+                            chain_id,
                             &iface_name,
                             ifindex,
                             &client_id,
@@ -429,24 +516,33 @@ pub async fn dhcp_v6_pd_client(
                             data,
                             &wan_route_info,
                             &route_service,
-                            addr_binding.as_ref(),
+                            chain_dataplane.as_ref(),
                             &prefix_map,
                             &mac_addr,
                             shared_wan_iid.as_ref(),
                             &mut current_wan_addr,
                             &prefix_sender,
                             expected_pd_len,
+                            &link_state,
                         )
                         .await;
                         if matches!(status, IpV6PdState::Bound { .. }) {
                             connect_failure_count = 0;
                         }
                         if need_reset_time {
-                            timeout_times = get_status_timeout_config(&status, 0, active_send.as_mut());
-                            // current_timeout_time = t2;
-
+                            let (next_times, next_timeout) =
+                                get_status_timeout_config(&status, 0, active_send.as_mut());
+                            timeout_times = next_times;
+                            tracing::debug!(
+                                iface = iface_name,
+                                %link_id,
+                                state = state_label(&status),
+                                timeout_times,
+                                next_timeout_secs = next_timeout.as_secs_f64(),
+                                "DHCPv6 PD timer reset after lease message"
+                            );
                         }
-                        swap_if_changed(&pd_runtime, pd_runtime_projection(&status));
+                        swap_if_changed(&pd_runtime, pd_runtime_projection(&status, current_wan_addr));
                     }
                     // message_rx close
                     None => break
@@ -458,12 +554,12 @@ pub async fn dhcp_v6_pd_client(
                 clear_active_pd_prefix(
                     link_id,
                     &iface_name,
-                    ifindex,
                     &route_service,
-                    addr_binding.as_ref(),
+                    chain_dataplane.as_ref(),
                     &prefix_map,
                     &prefix_sender,
                     &mut current_wan_addr,
+                    &link_state,
                 )
                 .await;
                 cleaned_up = true;
@@ -478,18 +574,30 @@ pub async fn dhcp_v6_pd_client(
                 break;
             }
         }
+
+        let status_after = state_label(&status);
+        if status_before != status_after {
+            tracing::info!(
+                iface = iface_name,
+                %link_id,
+                from = status_before,
+                to = status_after,
+                prefix_remaining_secs = ?active_prefix_remaining(&status).map(|d| d.as_secs_f64()),
+                "DHCPv6 PD state transition"
+            );
+        }
     }
 
     if !cleaned_up {
         clear_active_pd_prefix(
             link_id,
             &iface_name,
-            ifindex,
             &route_service,
-            addr_binding.as_ref(),
+            chain_dataplane.as_ref(),
             &prefix_map,
             &prefix_sender,
             &mut current_wan_addr,
+            &link_state,
         )
         .await;
     }
@@ -509,20 +617,33 @@ pub async fn dhcp_v6_pd_client(
 async fn clear_active_pd_prefix(
     link_id: Uuid,
     iface_name: &str,
-    ifindex: u32,
     route_service: &IpRouteService,
-    addr_binding: &dyn WanAddrBinding,
+    chain_dataplane: &WanLinkDataplane,
     prefix_map: &IAPrefixMap,
     prefix_sender: &IAPrefixEventSender,
     current_wan_addr: &mut Option<Ipv6Addr>,
+    link_state: &LinkStateHandle,
 ) {
     let removed = prefix_map.remove(&link_id);
+    if removed.is_some() || current_wan_addr.is_some() {
+        tracing::info!(
+            iface = iface_name,
+            %link_id,
+            prefix = ?removed.as_ref().map(|status| (
+                status.actual_prefix.prefix_ip,
+                status.actual_prefix.prefix_len,
+            )),
+            wan_addr = ?current_wan_addr,
+            "Removing active DHCPv6 PD prefix and WAN address"
+        );
+    }
     if let Some(status) = removed.as_ref() {
         remove_ip_route(&status.actual_prefix, iface_name);
     }
 
     route_service.remove_ipv6_link_route(link_id).await;
-    addr_binding.unbind_ipv6(ifindex);
+    chain_dataplane.unbind_wan_ipv6();
+    link_state.clear_v6_prefix();
     if let Some(wan_addr) = current_wan_addr.take() {
         del_iface_ip(wan_addr, 128, iface_name);
     }
@@ -544,30 +665,31 @@ impl SendStatusOutcome {
     const PREFIX_EXPIRED: Self = Self { reset_timeout: true, prefix_expired: true };
 }
 
-fn lease_projection(iapd: &v6::IAPD) -> Option<PdLease> {
+fn lease_projection(iapd: &v6::IAPD, wan_addr: Option<Ipv6Addr>) -> Option<PdLease> {
     match iapd.opts.get(OptionCode::IAPrefix) {
         Some(DhcpOption::IAPrefix(p)) => Some(PdLease {
             prefix_ip: p.prefix_ip,
             prefix_len: p.prefix_len,
             valid_secs: p.valid_lifetime,
             preferred_secs: p.preferred_lifetime,
+            wan_ip: wan_addr,
         }),
         _ => None,
     }
 }
 
-fn pd_runtime_projection(status: &IpV6PdState) -> PdRuntime {
+fn pd_runtime_projection(status: &IpV6PdState, wan_addr: Option<Ipv6Addr>) -> PdRuntime {
     match status {
         IpV6PdState::Solicit { .. } | IpV6PdState::Confirm => PdRuntime::Soliciting,
         IpV6PdState::Request { .. } => PdRuntime::Requesting,
         IpV6PdState::Bound { iapd, .. } => {
-            lease_projection(iapd).map_or(PdRuntime::Soliciting, PdRuntime::Bound)
+            lease_projection(iapd, wan_addr).map_or(PdRuntime::Soliciting, PdRuntime::Bound)
         }
         IpV6PdState::Renew { iapd, .. } | IpV6PdState::WaitToRebind { iapd, .. } => {
-            lease_projection(iapd).map_or(PdRuntime::Soliciting, PdRuntime::Renewing)
+            lease_projection(iapd, wan_addr).map_or(PdRuntime::Soliciting, PdRuntime::Renewing)
         }
         IpV6PdState::Rebind { iapd, .. } => {
-            lease_projection(iapd).map_or(PdRuntime::Soliciting, PdRuntime::Rebinding)
+            lease_projection(iapd, wan_addr).map_or(PdRuntime::Soliciting, PdRuntime::Rebinding)
         }
         IpV6PdState::Release { .. } | IpV6PdState::Decline | IpV6PdState::Stop => {
             PdRuntime::Stopped
@@ -594,6 +716,57 @@ fn active_prefix_remaining(status: &IpV6PdState) -> Option<Duration> {
     Some(valid_lifetime.saturating_sub(bound_time.elapsed()))
 }
 
+fn prefix_remaining_by_wall_clock(prefix: &LDIAPrefix) -> Duration {
+    let elapsed = (get_f64_timestamp() - prefix.last_update_time).max(0.0);
+    Duration::from_secs(prefix.valid_lifetime as u64)
+        .saturating_sub(Duration::from_secs_f64(elapsed))
+}
+
+fn retirement_grace(remaining: Duration) -> Duration {
+    remaining.min(PD_PREFIX_RETIRE_GRACE)
+}
+
+/// The old `/128` only needs a deprecation hint. Its `valid_lft` is set to the
+/// grace period, so the kernel removes the address on its own when it expires.
+fn plan_wan_addr_deprecation(
+    previous_wan_addr: Option<Ipv6Addr>,
+    new_wan_addr: Option<Ipv6Addr>,
+    previous_remaining: Duration,
+) -> Option<(Ipv6Addr, Duration)> {
+    let old_addr = previous_wan_addr?;
+    if new_wan_addr == Some(old_addr) {
+        return None;
+    }
+
+    let grace = retirement_grace(previous_remaining);
+    if grace.is_zero() {
+        return None;
+    }
+
+    Some((old_addr, grace))
+}
+
+fn deprecate_previous_pd_address(
+    previous_wan_addr: Option<Ipv6Addr>,
+    new_wan_addr: Option<Ipv6Addr>,
+    previous_remaining: Duration,
+    iface_name: &str,
+) {
+    let Some((wan_addr, grace)) =
+        plan_wan_addr_deprecation(previous_wan_addr, new_wan_addr, previous_remaining)
+    else {
+        return;
+    };
+    let valid_lifetime = grace.as_secs().clamp(1, u32::MAX as u64) as u32;
+    deprecate_iface_ip(wan_addr, 128, iface_name, valid_lifetime);
+    tracing::info!(
+        iface = iface_name,
+        %wan_addr,
+        valid_lifetime,
+        "Deprecated previous DHCPv6 PD WAN address; the kernel removes it when valid_lft expires"
+    );
+}
+
 /// Send the packet for the current state and report state-machine side effects.
 async fn send_current_status_packet(
     my_client_id: &[u8],
@@ -601,11 +774,15 @@ async fn send_current_status_packet(
     current_status: &mut IpV6PdState,
 ) -> SendStatusOutcome {
     if active_prefix_remaining(current_status).is_some_and(|remaining| remaining.is_zero()) {
-        tracing::warn!("DHCPv6 PD prefix valid lifetime expired; restarting solicitation");
+        tracing::warn!(
+            state = state_label(current_status),
+            "DHCPv6 PD prefix valid lifetime expired; restarting solicitation"
+        );
         *current_status = IpV6PdState::Solicit { xid: get_new_ipv6_xid() };
         return SendStatusOutcome::PREFIX_EXPIRED;
     }
 
+    let remaining_before = active_prefix_remaining(current_status);
     match current_status {
         IpV6PdState::Solicit { xid } => {
             let mut msg = v6::Message::new(v6::MessageType::Solicit);
@@ -613,6 +790,7 @@ async fn send_current_status_packet(
             msg.set_xid_num(*xid);
             msg.opts_mut().insert(v6::DhcpOption::ClientId(my_client_id.to_vec()));
 
+            tracing::debug!(xid, "Sending DHCPv6 PD Solicit");
             send_data(&msg, send_socket, None).await;
         }
         // IpV6PdState::Advertise { xid } => todo!(),
@@ -640,6 +818,12 @@ async fn send_current_status_packet(
             send_msg.opts_mut().insert(v6::DhcpOption::ClientId(my_client_id.to_vec()));
             send_msg.opts_mut().insert(DhcpOption::ServerId(service_id.clone()));
 
+            tracing::debug!(
+                xid = *xid,
+                send_times = *send_times,
+                server_id = ?service_id,
+                "Sending DHCPv6 PD Request"
+            );
             send_data(&send_msg, send_socket, None).await;
 
             // Request 没有收到响应到达一定次数需要进行回退到 Solicit
@@ -659,6 +843,13 @@ async fn send_current_status_packet(
             bound_time,
         } => {
             // t1 时间到 转换状态为 Renew
+            tracing::info!(
+                t1 = iapd.t1,
+                t2 = iapd.t2,
+                bound_elapsed_secs = bound_time.elapsed().as_secs_f64(),
+                remaining_secs = ?remaining_before.map(|d| d.as_secs_f64()),
+                "DHCPv6 PD t1 reached; transitioning Bound -> Renew"
+            );
             *current_status = IpV6PdState::Renew {
                 xid: get_new_ipv6_xid(),
                 service_id: service_id.clone(),
@@ -698,13 +889,26 @@ async fn send_current_status_packet(
             send_msg.opts_mut().insert(v6::DhcpOption::ClientId(my_client_id.to_vec()));
             send_msg.opts_mut().insert(DhcpOption::ServerId(service_id.clone()));
 
+            tracing::debug!(
+                xid = *xid,
+                server_id = ?service_id,
+                t1 = iapd.t1,
+                t2 = iapd.t2,
+                bound_elapsed_secs = bound_time.elapsed().as_secs_f64(),
+                remaining_secs = ?remaining_before.map(|d| d.as_secs_f64()),
+                "Sending DHCPv6 PD Renew"
+            );
             send_data(&send_msg, send_socket, None).await;
 
             let t2 = if iapd.t2 == 0 { IPV6_T2_DEFAULT } else { iapd.t2 as u64 };
             let t2 = t2 / 10 * 8;
             // Reach 80% wait to rebind
             if bound_time.elapsed().as_secs() >= t2 {
-                tracing::warn!("Renew turn to WaitToRebind");
+                tracing::warn!(
+                    bound_elapsed_secs = bound_time.elapsed().as_secs_f64(),
+                    rebind_threshold_secs = t2,
+                    "Renew turn to WaitToRebind"
+                );
                 // 切换状态为 Rebind
                 *current_status = IpV6PdState::WaitToRebind {
                     xid: *xid,
@@ -723,7 +927,11 @@ async fn send_current_status_packet(
             server_unicast,
             bound_time,
         } => {
-            tracing::warn!("WaitToRebind turn to Rebind");
+            tracing::warn!(
+                bound_elapsed_secs = bound_time.elapsed().as_secs_f64(),
+                remaining_secs = ?remaining_before.map(|d| d.as_secs_f64()),
+                "WaitToRebind turn to Rebind"
+            );
             // 切换状态为 Rebind
             *current_status = IpV6PdState::Rebind {
                 xid: get_new_ipv6_xid(),
@@ -755,6 +963,12 @@ async fn send_current_status_packet(
             send_msg.opts_mut().insert(v6::DhcpOption::ClientId(my_client_id.to_vec()));
             // send_msg.opts_mut().insert(DhcpOption::ServerId(service_id.clone()));
 
+            tracing::debug!(
+                xid = *xid,
+                rebind_elapsed_secs = rebind_time.elapsed().as_secs_f64(),
+                remaining_secs = ?remaining_before.map(|d| d.as_secs_f64()),
+                "Sending DHCPv6 PD Rebind"
+            );
             send_data(&send_msg, send_socket, None).await;
         }
         IpV6PdState::Release { .. } => todo!(),
@@ -789,11 +1003,11 @@ fn get_status_timeout_config(
     current_status: &IpV6PdState,
     prev_timeout_times: u64,
     mut timeout: Pin<&mut tokio::time::Sleep>,
-) -> u64 {
+) -> (u64, Duration) {
     let current_timeout = status_timeout_duration(current_status, prev_timeout_times);
 
     timeout.set(tokio::time::sleep(current_timeout));
-    prev_timeout_times + 1
+    (prev_timeout_times + 1, current_timeout)
 }
 
 fn status_timeout_duration(current_status: &IpV6PdState, prev_timeout_times: u64) -> Duration {
@@ -817,6 +1031,7 @@ fn status_timeout_duration(current_status: &IpV6PdState, prev_timeout_times: u64
 #[allow(clippy::too_many_arguments)]
 async fn handle_packet(
     link_id: Uuid,
+    chain_id: u16,
     iface_name: &str,
     ifindex: u32,
     my_client_id: &[u8],
@@ -824,13 +1039,14 @@ async fn handle_packet(
     (msg, msg_addr): (Vec<u8>, SocketAddr),
     wan_route_info: &RouteTargetInfo,
     route_service: &IpRouteService,
-    addr_binding: &dyn WanAddrBinding,
+    chain_dataplane: &WanLinkDataplane,
     prefix_map: &IAPrefixMap,
     mac_addr: &Option<MacAddr>,
     shared_wan_iid: &u64,
     current_wan_addr: &mut Option<Ipv6Addr>,
     prefix_sender: &IAPrefixEventSender,
     expected_pd_len: u8,
+    link_state: &LinkStateHandle,
 ) -> bool {
     let IpAddr::V6(ipv6addr) = msg_addr.ip() else {
         tracing::error!("unexpected IPV4 packet");
@@ -844,8 +1060,25 @@ async fn handle_packet(
             return true;
         }
     };
+    tracing::debug!(
+        iface = iface_name,
+        %link_id,
+        state = state_label(current_status),
+        message_type = ?new_v6_msg.msg_type(),
+        xid = new_v6_msg.xid_num(),
+        from = %msg_addr,
+        "DHCPv6 PD message received"
+    );
 
     if new_v6_msg.xid_num() != current_status.get_xid() {
+        tracing::debug!(
+            iface = iface_name,
+            %link_id,
+            state = state_label(current_status),
+            expected_xid = current_status.get_xid(),
+            received_xid = new_v6_msg.xid_num(),
+            "Ignoring DHCPv6 PD message with unmatched xid"
+        );
         return false;
     }
 
@@ -949,6 +1182,15 @@ async fn handle_packet(
                     }
                     if let Some(ia_prefix) = ia_prefix {
                         if success {
+                            let previous_prefix = prefix_map.load_actual(&link_id);
+                            let previous_wan_addr = *current_wan_addr;
+                            let previous_remaining = active_prefix_remaining(current_status)
+                                .or_else(|| {
+                                    previous_prefix.as_ref().map(prefix_remaining_by_wall_clock)
+                                })
+                                .unwrap_or(Duration::ZERO);
+                            let previous_state = state_label(current_status);
+
                             *current_status = IpV6PdState::Bound {
                                 xid: get_new_ipv6_xid(),
                                 service_id,
@@ -965,15 +1207,46 @@ async fn handle_packet(
                                 last_update_time: get_f64_timestamp(),
                             };
 
-                            let mut info = wan_route_info.clone();
-                            if let Some(wan_addr) = derive_wan_pd_addr(&ia_prefix, *shared_wan_iid)
+                            let wan_addr = derive_wan_pd_addr(&ia_prefix, *shared_wan_iid);
+                            let same_prefix = previous_prefix.as_ref().is_some_and(|old| {
+                                old.prefix_ip == ia_prefix.prefix_ip
+                                    && old.prefix_len == ia_prefix.prefix_len
+                            });
+                            let same_addr = previous_wan_addr == wan_addr;
+                            let action = if previous_prefix.is_none() && previous_wan_addr.is_none()
                             {
-                                if current_wan_addr.as_ref() != Some(&wan_addr)
-                                    && let Some(old_addr) = current_wan_addr.replace(wan_addr)
-                                {
-                                    del_iface_ip(old_addr, 128, iface_name);
-                                }
+                                "acquire"
+                            } else if same_prefix && same_addr {
+                                "refresh"
+                            } else {
+                                "replace"
+                            };
+                            tracing::info!(
+                                iface = iface_name,
+                                %link_id,
+                                from = previous_state,
+                                action,
+                                old_prefix = ?previous_prefix
+                                    .as_ref()
+                                    .map(|p| (p.prefix_ip, p.prefix_len)),
+                                new_prefix = %ia_prefix.prefix_ip,
+                                new_prefix_len = ia_prefix.prefix_len,
+                                old_wan_addr = ?previous_wan_addr,
+                                new_wan_addr = ?wan_addr,
+                                old_remaining_secs = previous_remaining.as_secs_f64(),
+                                preferred_lifetime = ia_prefix.preferred_lifetime,
+                                valid_lifetime = ia_prefix.valid_lifetime,
+                                t1 = iapd.t1,
+                                t2 = iapd.t2,
+                                gateway = %ipv6addr,
+                                "Applying DHCPv6 PD lease"
+                            );
 
+                            // Install the new lease first, then deprecate the old
+                            // prefix. This avoids deleting the only usable address
+                            // before the replacement is ready.
+                            let mut info = wan_route_info.clone();
+                            if let Some(wan_addr) = wan_addr {
                                 set_iface_ip(
                                     wan_addr,
                                     128,
@@ -984,17 +1257,44 @@ async fn handle_packet(
                                 info.iface_ip = IpAddr::V6(wan_addr);
                             }
                             info.gateway_ip = IpAddr::V6(ipv6addr);
-                            route_service.insert_ipv6_link_route(link_id, info).await;
+                            route_service
+                                .insert_ipv6_link_route(
+                                    link_id,
+                                    WanRouteTarget::link(chain_id, info),
+                                )
+                                .await;
                             replace_ip_route(
                                 &ia_prefix,
                                 ipv6addr,
                                 iface_name,
                                 ifindex,
                                 mac_addr,
-                                addr_binding,
+                                chain_dataplane,
                             );
+                            let wan_v6_prefix = WanV6Prefix {
+                                prefix_ip: ia_prefix.prefix_ip,
+                                prefix_len: ia_prefix.prefix_len,
+                            };
                             prefix_map.store(link_id, ia_prefix, expected_pd_len);
+                            // Publish the bound prefix and derived WAN /128 so
+                            // the nat6 section can start; unchanged renewals
+                            // deduplicate.
+                            link_state.set_v6_prefix(wan_v6_prefix, wan_addr);
+                            *current_wan_addr = wan_addr;
                             let _ = prefix_sender.send(IAPrefixEvent::Updated { link_id }).await;
+                            deprecate_previous_pd_address(
+                                previous_wan_addr,
+                                wan_addr,
+                                previous_remaining,
+                                iface_name,
+                            );
+                            tracing::info!(
+                                iface = iface_name,
+                                %link_id,
+                                wan_addr = ?wan_addr,
+                                action,
+                                "DHCPv6 PD address and route update sequence completed"
+                            );
                             tracing::debug!("current status move to: {:#?}", current_status);
                             return true;
                         } else {
@@ -1020,7 +1320,7 @@ fn replace_ip_route(
     iface_name: &str,
     ifindex: u32,
     mac: &Option<MacAddr>,
-    addr_binding: &dyn WanAddrBinding,
+    chain_dataplane: &WanLinkDataplane,
 ) {
     let result = std::process::Command::new("ip")
         .args([
@@ -1039,9 +1339,28 @@ fn replace_ip_route(
         ])
         .output();
 
-    addr_binding.bind_ipv6(ifindex, iapd.prefix_ip, Some(route_ip), iapd.prefix_len, *mac);
-    if let Err(e) = result {
-        tracing::error!("{e:?}");
+    chain_dataplane.bind_wan_ipv6(ifindex, iapd.prefix_ip, Some(route_ip), iapd.prefix_len, *mac);
+    match result {
+        Ok(output) if output.status.success() => {
+            tracing::info!(
+                iface = iface_name,
+                prefix = %format!("{}/{}", iapd.prefix_ip, iapd.prefix_len),
+                gateway = %route_ip,
+                expires = iapd.valid_lifetime,
+                "Replaced DHCPv6 PD source route"
+            );
+        }
+        Ok(output) => {
+            tracing::error!(
+                iface = iface_name,
+                prefix = %format!("{}/{}", iapd.prefix_ip, iapd.prefix_len),
+                gateway = %route_ip,
+                status = ?output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "failed to replace DHCPv6 PD source route"
+            );
+        }
+        Err(e) => tracing::error!(iface = iface_name, "{e:?}"),
     }
 }
 
@@ -1059,8 +1378,26 @@ fn remove_ip_route(iapd: &LDIAPrefix, iface_name: &str) {
         ])
         .output();
 
-    if let Err(err) = result {
-        tracing::error!(?err, "failed to remove expired IPv6 PD source route");
+    match result {
+        Ok(output) if output.status.success() => {
+            tracing::info!(
+                iface = iface_name,
+                prefix = %format!("{}/{}", iapd.prefix_ip, iapd.prefix_len),
+                "Removed DHCPv6 PD source route"
+            );
+        }
+        Ok(output) => {
+            tracing::warn!(
+                iface = iface_name,
+                prefix = %format!("{}/{}", iapd.prefix_ip, iapd.prefix_len),
+                status = ?output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "failed to remove DHCPv6 PD source route"
+            );
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to remove expired IPv6 PD source route");
+        }
     }
 }
 
@@ -1192,8 +1529,9 @@ mod tests {
 
     #[test]
     fn pd_runtime_projection_maps_fsm_phases() {
+        let wan_ip: Ipv6Addr = "2001:db8:1200::8000:0:0:1234".parse().unwrap();
         assert!(matches!(
-            pd_runtime_projection(&IpV6PdState::init_status()),
+            pd_runtime_projection(&IpV6PdState::init_status(), None),
             PdRuntime::Soliciting
         ));
 
@@ -1205,7 +1543,7 @@ mod tests {
             server_unicast: None,
             send_times: 0,
         };
-        assert!(matches!(pd_runtime_projection(&request), PdRuntime::Requesting));
+        assert!(matches!(pd_runtime_projection(&request, None), PdRuntime::Requesting));
 
         let bound = IpV6PdState::Bound {
             xid: 1,
@@ -1215,12 +1553,13 @@ mod tests {
             bound_time: Instant::now(),
         };
         assert_eq!(
-            pd_runtime_projection(&bound),
+            pd_runtime_projection(&bound, Some(wan_ip)),
             PdRuntime::Bound(PdLease {
                 prefix_ip: "2001:db8:1200::".parse().unwrap(),
                 prefix_len: 56,
                 valid_secs: 30,
                 preferred_secs: 30,
+                wan_ip: Some(wan_ip),
             })
         );
 
@@ -1232,7 +1571,7 @@ mod tests {
             renew_time: Instant::now(),
             bound_time: Instant::now(),
         };
-        assert!(matches!(pd_runtime_projection(&renew), PdRuntime::Renewing(_)));
+        assert!(matches!(pd_runtime_projection(&renew, Some(wan_ip)), PdRuntime::Renewing(_)));
 
         let wait_to_rebind = IpV6PdState::WaitToRebind {
             xid: 1,
@@ -1241,7 +1580,10 @@ mod tests {
             server_unicast: None,
             bound_time: Instant::now(),
         };
-        assert!(matches!(pd_runtime_projection(&wait_to_rebind), PdRuntime::Renewing(_)));
+        assert!(matches!(
+            pd_runtime_projection(&wait_to_rebind, Some(wan_ip)),
+            PdRuntime::Renewing(_)
+        ));
 
         let rebind = IpV6PdState::Rebind {
             xid: 1,
@@ -1251,9 +1593,9 @@ mod tests {
             rebind_time: Instant::now(),
             bound_time: Instant::now(),
         };
-        assert!(matches!(pd_runtime_projection(&rebind), PdRuntime::Rebinding(_)));
+        assert!(matches!(pd_runtime_projection(&rebind, Some(wan_ip)), PdRuntime::Rebinding(_)));
 
-        assert!(matches!(pd_runtime_projection(&IpV6PdState::Stop), PdRuntime::Stopped));
+        assert!(matches!(pd_runtime_projection(&IpV6PdState::Stop, None), PdRuntime::Stopped));
     }
 
     #[test]
@@ -1440,5 +1782,87 @@ mod tests {
         let addr: Ipv6Addr = "2001:db8::2".parse().unwrap();
         msg.opts_mut().insert(DhcpOption::ServerUnicast(addr));
         assert_eq!(extract_server_unicast(&msg), Some(addr));
+    }
+
+    #[test]
+    fn state_labels_are_distinct_for_every_phase() {
+        let labels = [
+            state_label(&IpV6PdState::init_status()),
+            state_label(&IpV6PdState::Bound {
+                xid: 1,
+                service_id: Vec::new(),
+                iapd: iapd(4, 8, 30),
+                server_unicast: None,
+                bound_time: Instant::now(),
+            }),
+            state_label(&IpV6PdState::Renew {
+                xid: 1,
+                service_id: Vec::new(),
+                iapd: iapd(4, 8, 30),
+                server_unicast: None,
+                renew_time: Instant::now(),
+                bound_time: Instant::now(),
+            }),
+            state_label(&IpV6PdState::WaitToRebind {
+                xid: 1,
+                service_id: Vec::new(),
+                iapd: iapd(4, 8, 30),
+                server_unicast: None,
+                bound_time: Instant::now(),
+            }),
+            state_label(&IpV6PdState::Rebind {
+                xid: 1,
+                service_id: Vec::new(),
+                iapd: iapd(4, 8, 30),
+                server_unicast: None,
+                rebind_time: Instant::now(),
+                bound_time: Instant::now(),
+            }),
+        ];
+
+        assert_eq!(labels, ["Solicit", "Bound", "Renew", "WaitToRebind", "Rebind"]);
+    }
+
+    #[test]
+    fn address_change_deprecates_old_address_for_bounded_grace() {
+        let old_wan: Ipv6Addr = "2001:db8:1000::1".parse().unwrap();
+        let new_wan: Ipv6Addr = "2001:db8:2000::1".parse().unwrap();
+
+        let (addr, grace) =
+            plan_wan_addr_deprecation(Some(old_wan), Some(new_wan), Duration::from_secs(900))
+                .expect("address change must deprecate the old address");
+
+        assert_eq!(addr, old_wan);
+        assert_eq!(grace, PD_PREFIX_RETIRE_GRACE);
+    }
+
+    #[test]
+    fn deprecation_grace_never_exceeds_old_valid_lifetime() {
+        let old_wan: Ipv6Addr = "2001:db8:1000::1".parse().unwrap();
+        let new_wan: Ipv6Addr = "2001:db8:2000::1".parse().unwrap();
+
+        let (_, grace) =
+            plan_wan_addr_deprecation(Some(old_wan), Some(new_wan), Duration::from_secs(45))
+                .expect("address change must deprecate the old address");
+
+        assert_eq!(grace, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn unchanged_address_is_not_deprecated() {
+        let wan_addr: Ipv6Addr = "2001:db8:1000::1".parse().unwrap();
+
+        assert!(
+            plan_wan_addr_deprecation(Some(wan_addr), Some(wan_addr), Duration::from_secs(300))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn address_without_remaining_lifetime_is_not_deprecated() {
+        let old_wan: Ipv6Addr = "2001:db8:1000::1".parse().unwrap();
+        let new_wan: Ipv6Addr = "2001:db8:2000::1".parse().unwrap();
+
+        assert!(plan_wan_addr_deprecation(Some(old_wan), Some(new_wan), Duration::ZERO).is_none());
     }
 }

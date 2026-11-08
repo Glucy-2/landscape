@@ -61,7 +61,7 @@ describe("formatV4Runtime", () => {
         t,
       ),
     ).toEqual({
-      text: 'runtime_v4_dhcp_bound {"ip":"10.0.0.30","prefix":24,"lease":3600}',
+      text: 'runtime_v4_dhcp_bound {"ip":"10.0.0.30","prefix":24}',
       tone: "success",
     });
     expect(
@@ -102,12 +102,13 @@ describe("formatV4Runtime", () => {
             local_ip: "100.64.1.1",
             peer_ip: "100.64.1.2",
             session_id: 31,
+            connected_at: 1_700_000_000_000,
           },
         },
         t,
       ),
     ).toEqual({
-      text: 'runtime_v4_pppoe_online {"local":"100.64.1.1","peer":"100.64.1.2","session":"0x1f"}',
+      text: "100.64.1.1",
       tone: "success",
     });
     expect(
@@ -136,11 +137,18 @@ describe("formatV4Runtime", () => {
     ).toEqual({ text: "runtime_v4_pppd_waiting_addr", tone: "info" });
     expect(
       formatV4Runtime(
-        { t: "pppd", online: { local_ip: "10.1.1.1", peer_ip: "10.1.1.2" } },
+        {
+          t: "pppd",
+          online: {
+            local_ip: "10.1.1.1",
+            peer_ip: "10.1.1.2",
+            connected_at: 1_700_000_000_000,
+          },
+        },
         t,
       ),
     ).toEqual({
-      text: 'runtime_v4_pppd_online {"local":"10.1.1.1","peer":"10.1.1.2"}',
+      text: "10.1.1.1",
       tone: "success",
     });
     expect(
@@ -184,7 +192,7 @@ describe("formatPdRuntime", () => {
 
   it("maps lease variants", () => {
     expect(formatPdRuntime({ bound: lease } as PdRuntime, t)).toEqual({
-      text: 'runtime_pd_bound {"prefix":"2001:db8:1200::","len":56,"valid":7200}',
+      text: 'runtime_pd_bound {"prefix":"2001:db8:1200::","len":56}',
       tone: "success",
     });
     expect(formatPdRuntime({ renewing: lease } as PdRuntime, t)).toEqual({

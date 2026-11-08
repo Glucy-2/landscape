@@ -14,21 +14,17 @@ use libbpf_rs::{
 use zerocopy::IntoBytes;
 
 use crate::tests::{
-    TestSkb, isolated_pin_root,
-    route::{
-        map_helper::{
-            LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE, WAN_IFINDEX,
-            WAN_ROUTE_TYPE, as_bytes, create_route6_cache_inner_map, insert_ip_mac_v6,
-            insert_route6_lan_entry, lookup_rt6_cache_value, put_rt6_cache_value,
-        },
-        packet_builder::{simple_ipv4_tcp, simple_ipv6_tcp_syn},
+    TestSkb,
+    helper::map::{
+        LAN_CACHE, LAN_ROUTE_TYPE, ROUTE_TYPE_NEXTHOP, TARGET_IFINDEX, WAN_CACHE, WAN_IFINDEX,
+        WAN_ROUTE_TYPE, as_bytes, create_route6_cache_inner_map, insert_ip_mac_v6,
+        insert_route6_lan_entry, lookup_rt6_cache_value, put_rt6_cache_value,
     },
+    isolated_pin_root,
+    pkt::{simple_ipv4_tcp, simple_ipv6_tcp_syn},
 };
 
-pub(crate) mod tc_wan_ingress_route {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bpf_rs/tc_wan_ingress_route.skel.rs"));
-}
-use tc_wan_ingress_route::TcWanIngressRouteSkel;
+use crate::skel::tc_wan_ingress_route::TcWanIngressRouteSkel;
 
 const RET_OK: i32 = 0;
 const RET_UNSPEC: i32 = -1;
@@ -64,7 +60,8 @@ fn wan_ctx(mark: u32) -> TestSkb {
 macro_rules! load_skel {
     ($pin:expr, $skel:ident) => {
         let pin_root = isolated_pin_root($pin);
-        let mut builder = tc_wan_ingress_route::TcWanIngressRouteSkelBuilder::default();
+        let mut builder =
+            crate::skel::tc_wan_ingress_route::TcWanIngressRouteSkelBuilder::default();
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = std::mem::MaybeUninit::uninit();
         let $skel = builder.open(&mut open_object).unwrap().load().unwrap();
@@ -550,14 +547,17 @@ fn wan6_ingress_raw_l3_no_mac_entry_redirects_bare() {
 
 #[test]
 fn wan6_ingress_truncated_ip6_header_passes_to_stack() {
-    // read_context truncation row (v6): ethertype claims IPv6 but the ip6
-    // header is cut short → SHOT from read_context, mapped to "pass".
+    // read_context truncation row (v6): cb[1] overruns the L3 header read →
+    // SHOT, mapped to "pass" (PROG_TEST_RUN rejects short frames, see the
+    // NOTE in tc_wan_ingress.rs).
     load_skel!("tc-wan6-runt", skel);
-    let mut pkt = vec![0xff_u8; 14 + 20]; // eth + partial ip6 header
+    let mut pkt = vec![0xff_u8; 14 + 40]; // eth + full-size "ip6" payload
     pkt[12] = 0x86;
     pkt[13] = 0xdd;
+    let mut ctx = wan_ctx(0);
+    ctx.cb[1] = 15; // 15 + 40 > 54 → header read overruns
 
-    let (ret, out) = run_wan6_ingress(&skel, &pkt, &mut wan_ctx(0));
+    let (ret, out) = run_wan6_ingress(&skel, &pkt, &mut ctx);
 
     assert_eq!(ret, RET_OK, "truncated ip6 header must pass, not drop");
     assert_eq!(out, pkt);

@@ -1,4 +1,3 @@
-use super::cmd::cmd_output;
 use super::env::{EnvConfig, PPPoETestEnv};
 use super::runner::{ClientSpec, start_client, wait_for_exit, wait_for_running};
 use super::scripted_server::{ScriptedServerMode, start_scripted_server};
@@ -15,23 +14,38 @@ fn spec_from(cfg: &EnvConfig) -> ClientSpec {
     }
 }
 
-/// Poll `tc filter show egress` inside the client namespace until the output
-/// contains `needle`, returning the last output either way.
-fn wait_for_egress_filter(client_ns: &str, iface: &str, needle: &str, timeout: Duration) -> String {
+/// Poll the scenario's pinned `tc_wan_egress_roots` prog array until the
+/// client iface's entry (`key = ifindex`) reaches `want_present`.  The entry
+/// is created by `WanLinkDataplane::new` when the link's service starts
+/// and removed by its `close()` teardown — the chain-injected successor
+/// of the old standalone `tc_pppoe_wan_egress` TC filter's
+/// attach/detach lifecycle.
+fn wait_for_egress_root_entry(
+    scenario: &str,
+    ifindex: u32,
+    want_present: bool,
+    timeout: Duration,
+) -> bool {
+    use libbpf_rs::{MapCore, MapHandle};
+
+    let path = std::path::PathBuf::from("/sys/fs/bpf/landscape")
+        .join(super::test_bpf_map_space(scenario))
+        .join("tc_chain")
+        .join("tc_wan_egress_roots");
     let deadline = Instant::now() + timeout;
-    let mut last = String::new();
     while Instant::now() < deadline {
-        last = cmd_output(
-            "ip",
-            &["netns", "exec", client_ns, "tc", "filter", "show", "egress", "dev", iface],
-        )
-        .unwrap_or_default();
-        if last.contains(needle) {
-            break;
+        let present = MapHandle::from_pinned_path(&path)
+            .ok()
+            .and_then(|map| {
+                map.lookup(&ifindex.to_ne_bytes(), libbpf_rs::MapFlags::ANY).ok().flatten()
+            })
+            .is_some();
+        if present == want_present {
+            return true;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    last
+    false
 }
 
 /// Full session negotiation reaches `Running` (which — after the Running
@@ -142,7 +156,7 @@ async fn link_loss_triggers_redial_and_reconnect() {
 
     // Server #2 comes back; the client redials (1 s backoff) and must
     // re-establish the session.  Re-establishment is observed server-side.
-    let server2 = start_scripted_server(
+    let mut server2 = start_scripted_server(
         env.server_ns().to_string(),
         env.server_iface().to_string(),
         env.server_mac(),
@@ -150,6 +164,11 @@ async fn link_loss_triggers_redial_and_reconnect() {
     );
     env.set_server_link(true).expect("bring server link back up");
     server2.established(Duration::from_secs(40)).expect("client should redial and reconnect");
+    // `established` fires before the client-side setup finishes: wait for
+    // proof that the new keepalive is running before stopping the client.
+    server2
+        .wait_keepalive_echo(Duration::from_secs(10))
+        .expect("reconnected session keepalive should run");
 
     assert!(client.status.is_running(), "status should stay Running across the reconnect");
 
@@ -158,13 +177,84 @@ async fn link_loss_triggers_redial_and_reconnect() {
     drop(env);
 }
 
-/// After the session is established, the `tc_pppoe_wan_egress` TC filter is
-/// attached to the client veth; after the client stops, the filter is
-/// detached again (TcHookProxy teardown).
+/// BR-style forced teardown: after establishment the server sends a PPPoE
+/// PADT.  The client must notice the PADT immediately (not after echo
+/// timeouts) and redial without the backoff, while the service status stays
+/// `Running`.  The 15 s backoff base makes the old behaviour (ignore PADT +
+/// echo detection + backoff ≈ 20+ s) fail the 10 s budget below.
+#[tokio::test]
+#[ignore = "requires root, veth pairs and eBPF; run with --include-ignored"]
+async fn padt_triggers_fast_redial() {
+    require_root();
+    let _map_space_cleanup = MapSpaceCleanup::new("padt-redial");
+
+    let env_cfg = EnvConfig::default();
+    let env = PPPoETestEnv::up(&env_cfg).expect("test environment should start");
+    let mut server = start_scripted_server(
+        env.server_ns().to_string(),
+        env.server_iface().to_string(),
+        env.server_mac(),
+        ScriptedServerMode::SuccessThenPadt,
+    );
+
+    // 1 s echo interval so that a *failure* to handle PADT would still be
+    // caught by echo loss eventually; combined with the 15 s backoff base
+    // the old behaviour cannot reconnect within the budget below.
+    let spec = ClientSpec {
+        echo_interval_secs: Some(1),
+        redial_backoff_base_secs: Some(15),
+        ..spec_from(&env_cfg)
+    };
+    let client = start_client(env.client_ns(), "padt-redial", env.client_info(), &spec);
+    wait_for_running(&client.status, Duration::from_secs(30))
+        .await
+        .expect("first session should reach Running");
+
+    // First establishment observed server-side; the server then sends PADT.
+    server.established(Duration::from_secs(10)).expect("first session should be established");
+
+    // The client must detect the PADT immediately and redial without the
+    // backoff.  The PADT is sent on the client's first echo, so the whole
+    // loop (echo → PADT → redial → second session) needs ~2 s; the budget
+    // below leaves generous headroom for parallel-test load while still
+    // failing for the old behaviour (ignore PADT + 6 s echo loss + 15 s
+    // backoff ≥ 21 s).
+    let started = Instant::now();
+    server
+        .established(Duration::from_secs(12))
+        .expect("client should redial immediately after PADT");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "redial after PADT must skip the backoff, took {:?}",
+        started.elapsed()
+    );
+
+    // Do not stop the client while it is still applying session #2's
+    // system/eBPF state (the server-side notification happens before the
+    // client-side setup finishes): wait for proof that the new keepalive is
+    // running.
+    server
+        .wait_keepalive_echo(Duration::from_secs(10))
+        .expect("second session keepalive should run");
+
+    assert!(client.status.is_running(), "status should stay Running across the reconnect");
+
+    client.stop_and_join(Duration::from_secs(15)).expect("client should stop cleanly");
+    server.wait().expect("server should observe the client termination");
+    drop(env);
+}
+
+/// After the session is established, the client iface's WAN egress chain
+/// root is registered (keyed by ifindex in the pinned `tc_wan_egress_roots`
+/// prog array) with the link's terminal PPPoE encap stage injected into the
+/// chain; after the client stops, the last stage's teardown removes the
+/// entry again.
 #[tokio::test]
 #[ignore = "requires root, veth pairs and eBPF; run with --include-ignored"]
 async fn ebpf_pipeline_attaches_and_detaches() {
     require_root();
+    // First binding → drops last, after the client exited and released its
+    // map fds: removes this scenario's eBPF map space from bpffs.
     let _map_space_cleanup = MapSpaceCleanup::new("ebpf-pipeline");
 
     let env_cfg = EnvConfig::default();
@@ -182,33 +272,18 @@ async fn ebpf_pipeline_attaches_and_detaches() {
         .await
         .expect("client should reach Running");
 
-    // The kernel truncates the program name to 15 chars.
-    let iface_name = env.client_info().name.clone();
-    let client_ns = env.client_ns().to_string();
-    let tc =
-        wait_for_egress_filter(&client_ns, &iface_name, "tc_pppoe_wan_eg", Duration::from_secs(5));
+    let ifindex = env.client_info().index;
     assert!(
-        tc.contains("tc_pppoe_wan_eg"),
-        "egress filter should reference tc_pppoe_wan_egress, got: {tc}"
+        wait_for_egress_root_entry("ebpf-pipeline", ifindex, true, Duration::from_secs(5)),
+        "WAN egress chain root should be registered for ifindex {ifindex} while running"
     );
 
     client.stop_and_join(Duration::from_secs(15)).expect("client should stop cleanly");
 
-    let detach_deadline = Instant::now() + Duration::from_secs(5);
-    let mut detached = false;
-    while Instant::now() < detach_deadline {
-        let out = cmd_output(
-            "ip",
-            &["netns", "exec", &client_ns, "tc", "filter", "show", "egress", "dev", &iface_name],
-        )
-        .unwrap_or_default();
-        if !out.contains("tc_pppoe_wan_eg") {
-            detached = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    assert!(detached, "egress filter should be detached after the client stops");
+    assert!(
+        wait_for_egress_root_entry("ebpf-pipeline", ifindex, false, Duration::from_secs(5)),
+        "WAN egress chain root entry should be removed after the client stops"
+    );
 
     server.wait().expect("server should observe the client termination");
     drop(env);

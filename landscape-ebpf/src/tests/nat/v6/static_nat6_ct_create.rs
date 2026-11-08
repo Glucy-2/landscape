@@ -1,11 +1,6 @@
-use std::{
-    mem::MaybeUninit,
-    net::{IpAddr, Ipv6Addr},
-    str::FromStr,
-};
+use std::{mem::MaybeUninit, net::Ipv6Addr, str::FromStr};
 
 use etherparse::{PacketBuilder, PacketHeaders};
-use landscape_common::net::MacAddr;
 use libbpf_rs::{
     MapCore, MapFlags, ProgramInput,
     skel::{OpenSkel, SkelBuilder as _},
@@ -13,9 +8,9 @@ use libbpf_rs::{
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
+    maps::nat::StaticNatMappingV6Item,
     maps::{Nat6TimerKey, Nat6TimerValue},
-    maps::{nat::StaticNatMappingV6Item, wan::add_wan_ip},
-    stages::nat::tc_nat_skel::TcNatSkelBuilder,
+    skel::tc_nat6::TcNat6SkelBuilder,
     tests::TestSkb,
 };
 
@@ -99,21 +94,17 @@ mod tests {
 
     #[test]
     fn udp_egress_creates_ct_with_is_static_one() {
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-static-ct-create");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(60);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            60,
-            Some(MacAddr::broadcast()),
-        );
 
         add_static_nat6_mapping(
             &skel.maps.nat6_static_map,
@@ -132,7 +123,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = skel.progs.tc_nat_wan_egress.test_run(input).expect("test_run failed");
+        let result = skel.progs.tc_nat_wan_egress_v6.test_run(input).expect("test_run failed");
         assert_eq!(result.return_value as i32, -1, "egress should return TC_ACT_UNSPEC(-1)");
 
         // NPTv6 prefix translation
@@ -165,21 +156,17 @@ mod tests {
 
     #[test]
     fn udp_ingress_creates_ct_with_is_static_one() {
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-static-ct-create");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(60);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            60,
-            Some(MacAddr::broadcast()),
-        );
 
         add_static_nat6_mapping(
             &skel.maps.nat6_static_map,
@@ -199,7 +186,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = skel.progs.tc_nat_wan_ingress.test_run(input).expect("test_run failed");
+        let result = skel.progs.tc_nat_wan_ingress_v6.test_run(input).expect("test_run failed");
         assert_eq!(result.return_value as i32, 0, "ingress should return TC_ACT_OK(0)");
 
         // NPTv6 dst rewrite
@@ -232,21 +219,17 @@ mod tests {
 
     #[test]
     fn udp_egress_ct_from_port_zero_static() {
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-port-zero-ct-create");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(60);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            60,
-            Some(MacAddr::broadcast()),
-        );
 
         add_static_nat6_mapping(
             &skel.maps.nat6_static_map,
@@ -263,7 +246,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = skel.progs.tc_nat_wan_egress.test_run(input).expect("test_run failed");
+        let result = skel.progs.tc_nat_wan_egress_v6.test_run(input).expect("test_run failed");
         assert_eq!(result.return_value as i32, -1, "egress should return TC_ACT_UNSPEC(-1)");
 
         let pkt_out = PacketHeaders::from_ethernet_slice(&packet_out).expect("parse output");
@@ -289,21 +272,18 @@ mod tests {
 
     #[test]
     fn udp_ingress_ct_from_port_zero_static() {
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-port-zero-ct-create");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
-        let skel = open_skel.load().unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(60);
+        }
 
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            60,
-            Some(MacAddr::broadcast()),
-        );
+        let skel = open_skel.load().unwrap();
 
         add_static_nat6_mapping(
             &skel.maps.nat6_static_map,
@@ -321,7 +301,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = skel.progs.tc_nat_wan_ingress.test_run(input).expect("test_run failed");
+        let result = skel.progs.tc_nat_wan_ingress_v6.test_run(input).expect("test_run failed");
         assert_eq!(result.return_value as i32, 0, "ingress should return TC_ACT_OK(0)");
 
         let pkt_out = PacketHeaders::from_ethernet_slice(&packet_out).expect("parse output");
@@ -350,21 +330,17 @@ mod tests {
 
     #[test]
     fn udp_egress_zero_prefix_static_creates_pass_ct() {
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-zero-prefix-egress");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(60);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            60,
-            Some(MacAddr::broadcast()),
-        );
         add_static_nat6_mapping(
             &skel.maps.nat6_static_map,
             vec![StaticNatMappingV6Item { port: 53, lan_ip: local_target(), l4_protocol: 17 }],
@@ -376,7 +352,7 @@ mod tests {
             let mut packet_out = vec![0u8; pkt.len()];
             let result = skel
                 .progs
-                .tc_nat_wan_egress
+                .tc_nat_wan_egress_v6
                 .test_run(ProgramInput {
                     data_in: Some(&pkt),
                     context_in: Some(ctx.as_mut_bytes()),
@@ -402,21 +378,17 @@ mod tests {
 
     #[test]
     fn udp_ingress_zero_prefix_static_creates_pass_ct() {
-        let mut builder = TcNatSkelBuilder::default();
+        let mut builder = TcNat6SkelBuilder::default();
         let pin_root = crate::tests::isolated_pin_root("nat-v6-zero-prefix-ingress");
         builder.object_builder_mut().pin_root_path(&pin_root).unwrap();
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = builder.open(&mut open_object).unwrap();
+        let mut open_skel = builder.open(&mut open_object).unwrap();
+        {
+            let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+            rodata.wan_ro_prefix6.b = crate::stages::nat6::wan_ro_prefix6(Some(wan_ip()));
+            rodata.wan_ro_npt_mask = crate::maps::wan::compute_npt_mask(60);
+        }
         let skel = open_skel.load().unwrap();
-
-        add_wan_ip(
-            &skel.maps.wan_ip_binding,
-            IFINDEX,
-            IpAddr::V6(wan_ip()),
-            None,
-            60,
-            Some(MacAddr::broadcast()),
-        );
         add_static_nat6_mapping(
             &skel.maps.nat6_static_map,
             vec![StaticNatMappingV6Item { port: 53, lan_ip: local_target(), l4_protocol: 17 }],
@@ -428,7 +400,7 @@ mod tests {
             let mut packet_out = vec![0u8; pkt.len()];
             let result = skel
                 .progs
-                .tc_nat_wan_ingress
+                .tc_nat_wan_ingress_v6
                 .test_run(ProgramInput {
                     data_in: Some(&pkt),
                     context_in: Some(ctx.as_mut_bytes()),

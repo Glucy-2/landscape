@@ -19,15 +19,12 @@ char LICENSE[] SEC("license") = "GPL";
 
 const volatile u32 current_l3_offset = 14;
 
-#undef BPF_LOG_TOPIC
-
 #define TC_LAN_INGRESS_V4_SLOT 0
 #define TC_LAN_INGRESS_V6_SLOT 1
 
 static __always_inline int tc_route4_pick_wan_in_lan(struct __sk_buff *skb, u32 current_l3_offset,
                                                      const struct route4_context *context,
                                                      const u32 flow_id) {
-#define BPF_LOG_TOPIC "tc_route4_pick_wan_in_lan"
     const u32 resolved_flow_id = get_flow_id(flow_id);
 
     struct route4_slot_key slot_key = {
@@ -38,10 +35,12 @@ static __always_inline int tc_route4_pick_wan_in_lan(struct __sk_buff *skb, u32 
 
     if (target_info == NULL) {
         if (resolved_flow_id == 0) {
-            ld_bpf_log("DROP default flow v4, no target for: %pI4", &context->saddr);
+            ld_from_lan_log("DROP default flow v4, no target for: %pI4 -> %pI4 slot %u",
+                            &context->saddr, &context->daddr, slot_key.slot);
             return TC_ACT_SHOT;
         }
-        ld_bpf_log("DROP flow_id v4: %d, ip: %pI4", resolved_flow_id, &context->saddr);
+        ld_from_lan_log("DROP flow_id v4: %d, ip: %pI4 -> %pI4 slot %u", resolved_flow_id,
+                        &context->saddr, &context->daddr, slot_key.slot);
         return TC_ACT_SHOT;
     }
 
@@ -50,14 +49,14 @@ static __always_inline int tc_route4_pick_wan_in_lan(struct __sk_buff *skb, u32 
     if (target_info->ifindex != skb->ingress_ifindex) {
         if (current_l3_offset == 0 && target_info->has_mac) {
             if (prepend_dummy_mac(skb) != 0) {
-                ld_bpf_log("add dummy_mac fail");
+                ld_from_lan_log("add dummy_mac fail");
                 return TC_ACT_SHOT;
             }
         }
 
         if (target_info->is_docker) {
             int ret = bpf_skb_vlan_push(skb, ETH_P_8021Q, get_flow_vlan_id(resolved_flow_id));
-            if (ret) ld_bpf_log("bpf_skb_vlan_push error");
+            if (ret) ld_from_lan_log("bpf_skb_vlan_push error");
             return bpf_redirect(target_info->ifindex, 0);
         }
 
@@ -70,16 +69,16 @@ static __always_inline int tc_route4_pick_wan_in_lan(struct __sk_buff *skb, u32 
                     mac_stored = true;
                 } else {
                     mac_stored = false;
-                    ld_bpf_log("store_mac_v4 err: %d", ret);
+                    ld_from_lan_log("store_mac_v4 err: %d", ret);
                 }
             } else {
                 mac_stored = false;
-                ld_bpf_log("can't find mac by: %pI4", &target_info->gate_addr);
+                ld_from_lan_log("can't find mac by: %pI4", &target_info->gate_addr);
             }
         }
     }
 
-    skb->cb[TC_CHAIN_CB_FORWARDED_OFFSET] = 1;
+    tc_cb_mark_forwarded(skb, target_info->link_chain_id);
 
     if (mac_stored) {
         return bpf_redirect(target_info->ifindex, 0);
@@ -90,15 +89,13 @@ static __always_inline int tc_route4_pick_wan_in_lan(struct __sk_buff *skb, u32 
     param.ipv4_nh = target_info->gate_addr;
     int neigh_ret = bpf_redirect_neigh(target_info->ifindex, &param, sizeof(param), 0);
     if (unlikely(neigh_ret != TC_ACT_REDIRECT))
-        ld_bpf_log("bpf_redirect_neigh error: %d", neigh_ret);
+        ld_from_lan_log("bpf_redirect_neigh error: %d", neigh_ret);
     return neigh_ret;
-#undef BPF_LOG_TOPIC
 }
 
 static __always_inline int tc_route6_pick_wan_in_lan(struct __sk_buff *skb, u32 current_l3_offset,
                                                      const struct route6_context *context,
                                                      const u32 flow_id) {
-#define BPF_LOG_TOPIC "tc_route6_pick_wan_in_lan"
     const u32 resolved_flow_id = get_flow_id(flow_id);
 
     struct route6_slot_key slot_key = {
@@ -109,10 +106,10 @@ static __always_inline int tc_route6_pick_wan_in_lan(struct __sk_buff *skb, u32 
 
     if (target_info == NULL) {
         if (resolved_flow_id == 0) {
-            ld_bpf_log("DROP default flow v6, no target");
+            ld_from_lan_log("DROP default flow v6, no target");
             return TC_ACT_SHOT;
         }
-        ld_bpf_log("DROP flow_id v6: %d", resolved_flow_id);
+        ld_from_lan_log("DROP flow_id v6: %d", resolved_flow_id);
         return TC_ACT_SHOT;
     }
 
@@ -121,14 +118,14 @@ static __always_inline int tc_route6_pick_wan_in_lan(struct __sk_buff *skb, u32 
     if (target_info->ifindex != skb->ingress_ifindex) {
         if (current_l3_offset == 0 && target_info->has_mac) {
             if (prepend_dummy_mac_v6(skb) != 0) {
-                ld_bpf_log("add dummy_mac fail");
+                ld_from_lan_log("add dummy_mac fail");
                 return TC_ACT_SHOT;
             }
         }
 
         if (target_info->is_docker) {
             int ret = bpf_skb_vlan_push(skb, ETH_P_8021Q, get_flow_vlan_id(resolved_flow_id));
-            if (ret) ld_bpf_log("bpf_skb_vlan_push error");
+            if (ret) ld_from_lan_log("bpf_skb_vlan_push error");
             return bpf_redirect(target_info->ifindex, 0);
         }
 
@@ -141,46 +138,44 @@ static __always_inline int tc_route6_pick_wan_in_lan(struct __sk_buff *skb, u32 
                     mac_stored = true;
                 } else {
                     mac_stored = false;
-                    ld_bpf_log("store_mac_v6 err: %d", ret);
+                    ld_from_lan_log("store_mac_v6 err: %d", ret);
                 }
             } else {
                 mac_stored = false;
-                ld_bpf_log("can't find mac by: %pI6", &target_info->gate_addr);
+                ld_from_lan_log("can't find mac by: %pI6", &target_info->gate_addr);
             }
         }
     }
 
-    skb->cb[TC_CHAIN_CB_FORWARDED_OFFSET] = 1;
+    tc_cb_mark_forwarded(skb, target_info->link_chain_id);
 
     if (mac_stored) return bpf_redirect(target_info->ifindex, 0);
 
     struct bpf_redir_neigh param;
     param.nh_family = AF_INET6;
-    COPY_ADDR_FROM(param.ipv6_nh, target_info->gate_addr.all);
+    COPY_ADDR_FROM(param.ipv6_nh, target_info->gate_addr.in6_u.u6_addr32);
     int neigh_ret = bpf_redirect_neigh(target_info->ifindex, &param, sizeof(param), 0);
     if (unlikely(neigh_ret != TC_ACT_REDIRECT))
-        ld_bpf_log("bpf_redirect_neigh error: %d", neigh_ret);
+        ld_from_lan_log("bpf_redirect_neigh error: %d", neigh_ret);
     return neigh_ret;
-#undef BPF_LOG_TOPIC
 }
 
 SEC("tc/ingress")
 int tc_route4_lan_ingress(struct __sk_buff *skb) {
-#define BPF_LOG_TOPIC "tc_route4_lan_ingress"
     int ret = 0;
-    u32 flow_mark = skb->mark;
+    u32 flow_mark = skb_mark(skb);
     struct route4_context context = {0};
-    struct packet_offset_info offset_info = {0};
+    struct route_view view = {0};
 
-    ret = scan_route_packet(skb, current_l3_offset, &offset_info);
-    if (ret == LD_SCAN_ERR) {
+    ret = scan_route_packet(skb, current_l3_offset, &view);
+    if (ret == TC_ACT_SHOT) {
         return TC_ACT_SHOT;
     }
     if (ret != TC_ACT_OK) {
         return TC_ACT_OK;
     }
 
-    ret = route4_read_context_from_scan(skb, &offset_info, &context);
+    ret = route4_read_context_from_scan(skb, &view, &context);
     if (ret != TC_ACT_OK) {
         return TC_ACT_OK;
     }
@@ -191,7 +186,7 @@ int tc_route4_lan_ingress(struct __sk_buff *skb) {
 
     ret = route4_search_cache_in_lan(skb, current_l3_offset, &context, &flow_mark);
     if (ret != TC_ACT_OK) {
-        skb->mark = replace_flow_source(flow_mark, FLOW_FROM_LAN);
+        skb_set_mark(skb, flow_mark);
         return ret;
     }
 
@@ -206,9 +201,7 @@ int tc_route4_lan_ingress(struct __sk_buff *skb) {
     if (ret != TC_ACT_OK) {
         return ret;
     }
-
-    barrier_var(flow_mark);
-    skb->mark = replace_flow_source(flow_mark, FLOW_FROM_LAN);
+    skb_set_mark(skb, flow_mark);
 
     ret = tc_route4_pick_wan_in_lan(skb, current_l3_offset, &context, flow_mark);
 
@@ -216,37 +209,35 @@ int tc_route4_lan_ingress(struct __sk_buff *skb) {
         route4_set_cache_in_lan(&context, flow_mark);
     }
     return ret;
-#undef BPF_LOG_TOPIC
 }
 
 SEC("tc/ingress")
 int tc_route6_lan_ingress(struct __sk_buff *skb) {
-#define BPF_LOG_TOPIC "tc_route6_lan_ingress"
     int ret = 0;
-    u32 flow_mark = skb->mark;
+    u32 flow_mark = skb_mark(skb);
     struct route6_context context = {0};
-    struct packet_offset_info offset_info = {0};
+    struct route_view view = {0};
 
-    ret = scan_route_packet(skb, current_l3_offset, &offset_info);
-    if (ret == LD_SCAN_ERR) {
+    ret = scan_route_packet(skb, current_l3_offset, &view);
+    if (ret == TC_ACT_SHOT) {
         return TC_ACT_SHOT;
     }
     if (ret != TC_ACT_OK) {
         return TC_ACT_OK;
     }
 
-    ret = route6_read_context_from_scan(skb, &offset_info, &context);
+    ret = route6_read_context_from_scan(skb, &view, &context);
     if (ret != TC_ACT_OK) {
         return TC_ACT_OK;
     }
 
-    if (unlikely(is_broadcast_ip6(context.daddr.bytes))) {
+    if (unlikely(is_broadcast_ip6(context.daddr.in6_u.u6_addr8))) {
         return TC_ACT_UNSPEC;
     }
 
     ret = route6_search_cache_in_lan(skb, current_l3_offset, &context, &flow_mark);
     if (ret != TC_ACT_OK) {
-        skb->mark = replace_flow_source(flow_mark, FLOW_FROM_LAN);
+        skb_set_mark(skb, flow_mark);
         return ret;
     }
 
@@ -261,9 +252,7 @@ int tc_route6_lan_ingress(struct __sk_buff *skb) {
     if (ret != TC_ACT_OK) {
         return ret;
     }
-
-    barrier_var(flow_mark);
-    skb->mark = replace_flow_source(flow_mark, FLOW_FROM_LAN);
+    skb_set_mark(skb, flow_mark);
 
     ret = tc_route6_pick_wan_in_lan(skb, current_l3_offset, &context, flow_mark);
 
@@ -271,7 +260,6 @@ int tc_route6_lan_ingress(struct __sk_buff *skb) {
         route6_set_cache_in_lan(&context, flow_mark);
     }
     return ret;
-#undef BPF_LOG_TOPIC
 }
 
 struct {
@@ -290,7 +278,6 @@ struct {
 
 SEC("tc/ingress")
 int tc_lan_ingress_route(struct __sk_buff *skb) {
-#define BPF_LOG_TOPIC "tc_lan_ingress_route"
     bool is_ipv4;
     int ret;
 
@@ -311,12 +298,11 @@ int tc_lan_ingress_route(struct __sk_buff *skb) {
 
     if (is_ipv4) {
         bpf_tail_call_static(skb, &ls_lan_ingress_tails, TC_LAN_INGRESS_V4_SLOT);
-        ld_bpf_log("bpf_tail_call_static error");
+        ld_from_lan_log("bpf_tail_call_static error");
     } else {
         bpf_tail_call_static(skb, &ls_lan_ingress_tails, TC_LAN_INGRESS_V6_SLOT);
-        ld_bpf_log("bpf_tail_call_static error");
+        ld_from_lan_log("bpf_tail_call_static error");
     }
 
     return TC_ACT_SHOT;
-#undef BPF_LOG_TOPIC
 }

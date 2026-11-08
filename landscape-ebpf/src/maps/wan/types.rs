@@ -25,7 +25,9 @@ pub(crate) struct WanIpInfoValue {
 mod tests {
     use super::*;
     use crate::maps::Inet6Bytes;
-    use crate::stages::nat::xdp_nat_skel::types as share;
+    // The NAT objects no longer carry `wan_ip_binding` (they bake rodata
+    // instead); the WAN ingress route object anchors the shared layout.
+    use crate::skel::tc_wan_ingress_route::types as share;
 
     #[test]
     fn wan_ip_layouts_match_skel() {

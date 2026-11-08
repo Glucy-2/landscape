@@ -18,8 +18,6 @@ char LICENSE[] SEC("license") = "GPL";
 
 const volatile u32 current_l3_offset = 14;
 
-#undef BPF_LOG_TOPIC
-
 // Solicited-node multicast ff02::1:ff00:0:0:0:0:0/104
 // Byte layout: ff 02 00 00 00 00 00 00 00 00 00 01 ff XX XX XX
 static __always_inline bool is_solicited_node_multicast(const u8 *addr) {
@@ -57,6 +55,17 @@ static __always_inline bool is_link_local_ip6(const u8 *bytes) {
 
 static __always_inline bool is_multicast_ip6(const u8 *bytes) { return bytes[0] == 0xff; }
 
+// LAN subnets are /64 (see compute_subnets), so an all-zero low 64-bit
+// interface ID is the subnet-router anycast/network address, not a host.
+static __always_inline bool is_zero_iid_ip6(const u8 *bytes) {
+    u8 zero = 0;
+#pragma unroll
+    for (int i = 8; i < 16; i++) {
+        zero |= bytes[i];
+    }
+    return zero == 0;
+}
+
 static __always_inline bool is_same_mac(const u8 *a, const u8 *b) {
     return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3] && a[4] == b[4] &&
            a[5] == b[5];
@@ -78,13 +87,12 @@ static __always_inline void emit_ip6_dao_event(u32 ifindex, const u8 *ip, const 
 
 SEC("tc/ingress")
 int tc_lan_dao(struct __sk_buff *skb) {
-#define BPF_LOG_TOPIC "tc_lan_dao"
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
+    char *data = (char *)(long)skb->data;
+    char *data_end = (char *)(long)skb->data_end;
 
     if (current_l3_offset > 0) {
-        struct ethhdr *eth = data;
-        if ((void *)(eth + 1) > data_end) return TC_ACT_UNSPEC;
+        struct ethhdr *eth = (struct ethhdr *)data;
+        if ((char *)(eth + 1) > data_end) return TC_ACT_UNSPEC;
         if (eth->h_proto != ETH_IPV6) return TC_ACT_UNSPEC;
     }
 
@@ -102,9 +110,15 @@ int tc_lan_dao(struct __sk_buff *skb) {
         return TC_ACT_UNSPEC;
     }
 
-    struct ipv6hdr *ip6h;
-    if (VALIDATE_READ_DATA(skb, &ip6h, current_l3_offset, sizeof(*ip6h))) {
-        return TC_ACT_UNSPEC;
+    if ((u64)current_l3_offset + sizeof(struct ipv6hdr) > MAX_OFFSET) return TC_ACT_UNSPEC;
+    struct ipv6hdr *ip6h = (struct ipv6hdr *)(data + current_l3_offset);
+    if ((char *)(ip6h + 1) > data_end) {
+        __u32 need = current_l3_offset + sizeof(*ip6h);
+        if (bpf_skb_pull_data(skb, need) != 0) return TC_ACT_UNSPEC;
+        data = (char *)(long)skb->data;
+        data_end = (char *)(long)skb->data_end;
+        ip6h = (struct ipv6hdr *)(data + current_l3_offset);
+        if ((char *)(ip6h + 1) > data_end) return TC_ACT_UNSPEC;
     }
 
     u8 nexthdr = ip6h->nexthdr;
@@ -113,18 +127,30 @@ int tc_lan_dao(struct __sk_buff *skb) {
     // Walk IPv6 extension headers (RFC 8200)
     for (int i = 0; i < LD_MAX_IPV6_EXT_NUM && nexthdr != NEXTHDR_ICMP; i++) {
         if (nexthdr == NEXTHDR_HOP || nexthdr == NEXTHDR_ROUTING || nexthdr == NEXTHDR_DEST) {
-            struct ipv6_opt_hdr *opthdr;
-            if (VALIDATE_READ_DATA(skb, &opthdr, l4_offset, sizeof(*opthdr))) {
-                return TC_ACT_UNSPEC;
+            if ((u64)l4_offset + sizeof(struct ipv6_opt_hdr) > MAX_OFFSET) return TC_ACT_UNSPEC;
+            struct ipv6_opt_hdr *opthdr = (struct ipv6_opt_hdr *)(data + l4_offset);
+            if ((char *)(opthdr + 1) > data_end) {
+                __u32 need = l4_offset + sizeof(*opthdr);
+                if (bpf_skb_pull_data(skb, need) != 0) return TC_ACT_UNSPEC;
+                data = (char *)(long)skb->data;
+                data_end = (char *)(long)skb->data_end;
+                opthdr = (struct ipv6_opt_hdr *)(data + l4_offset);
+                if ((char *)(opthdr + 1) > data_end) return TC_ACT_UNSPEC;
             }
             l4_offset += (opthdr->hdrlen + 1) * 8;
             nexthdr = opthdr->nexthdr;
             continue;
         }
         if (nexthdr == NEXTHDR_FRAGMENT) {
-            struct frag_hdr *frag_hdr;
-            if (VALIDATE_READ_DATA(skb, &frag_hdr, l4_offset, sizeof(*frag_hdr))) {
-                return TC_ACT_UNSPEC;
+            if ((u64)l4_offset + sizeof(struct frag_hdr) > MAX_OFFSET) return TC_ACT_UNSPEC;
+            struct frag_hdr *frag_hdr = (struct frag_hdr *)(data + l4_offset);
+            if ((char *)(frag_hdr + 1) > data_end) {
+                __u32 need = l4_offset + sizeof(*frag_hdr);
+                if (bpf_skb_pull_data(skb, need) != 0) return TC_ACT_UNSPEC;
+                data = (char *)(long)skb->data;
+                data_end = (char *)(long)skb->data_end;
+                frag_hdr = (struct frag_hdr *)(data + l4_offset);
+                if ((char *)(frag_hdr + 1) > data_end) return TC_ACT_UNSPEC;
             }
             u16 raw_off = bpf_ntohs(frag_hdr->frag_off);
             u16 frag_off = raw_off & IPV6_FRAG_OFFSET;
@@ -147,9 +173,15 @@ int tc_lan_dao(struct __sk_buff *skb) {
     // DAD NS uses the unspecified source address (RFC 4862)
     if (!is_unspecified_ip6(saddr)) return TC_ACT_UNSPEC;
 
-    struct icmp6hdr *icmp6h;
-    if (VALIDATE_READ_DATA(skb, &icmp6h, l4_offset, sizeof(*icmp6h))) {
-        return TC_ACT_UNSPEC;
+    if ((u64)l4_offset + sizeof(struct icmp6hdr) > MAX_OFFSET) return TC_ACT_UNSPEC;
+    struct icmp6hdr *icmp6h = (struct icmp6hdr *)(data + l4_offset);
+    if ((char *)(icmp6h + 1) > data_end) {
+        __u32 need = l4_offset + sizeof(*icmp6h);
+        if (bpf_skb_pull_data(skb, need) != 0) return TC_ACT_UNSPEC;
+        data = (char *)(long)skb->data;
+        data_end = (char *)(long)skb->data_end;
+        icmp6h = (struct icmp6hdr *)(data + l4_offset);
+        if ((char *)(icmp6h + 1) > data_end) return TC_ACT_UNSPEC;
     }
     if (icmp6h->icmp6_type != ICMPV6_NEIGHBOR_SOLICIT || icmp6h->icmp6_code != 0) {
         return TC_ACT_UNSPEC;
@@ -167,6 +199,11 @@ int tc_lan_dao(struct __sk_buff *skb) {
         return TC_ACT_UNSPEC;
     }
 
+    // The subnet-router anycast address (IID all zero) is not a host address.
+    // Learning it would bind the anycast to the claimant's MAC and redirect
+    // traffic there.
+    if (is_zero_iid_ip6(target)) return TC_ACT_UNSPEC;
+
     // DAD NS must be sent to the solicited-node multicast of the target
     // itself (RFC 4861), not to a different solicited-node address.
     if (!is_target_solicited_node(daddr, target)) return TC_ACT_UNSPEC;
@@ -179,10 +216,10 @@ int tc_lan_dao(struct __sk_buff *skb) {
     // Reachable entries), which must never be bound to a claimant's MAC.
     struct route6_lan_key lan_key = {0};
     lan_key.prefixlen = 128;
-    __builtin_memcpy(lan_key.addr.bytes, target, sizeof(target));
+    __builtin_memcpy(lan_key.addr.in6_u.u6_addr8, target, sizeof(target));
     struct route6_lan_info *lan_info = bpf_map_lookup_elem(&rt6_lan_map, &lan_key);
-    union u_inet6_addr target_addr = {0};
-    __builtin_memcpy(target_addr.bytes, target, sizeof(target));
+    struct in6_addr target_addr = {0};
+    __builtin_memcpy(target_addr.in6_u.u6_addr8, target, sizeof(target));
     if (!lan_info || lan_info->route_type != ROUTE_TYPE_LAN ||
         lan_info->ifindex != skb->ingress_ifindex ||
         ip_addr_equal_in6(&lan_info->addr, &target_addr)) {
@@ -192,14 +229,14 @@ int tc_lan_dao(struct __sk_buff *skb) {
     if (current_l3_offset == 0) return TC_ACT_UNSPEC;
 
     // Source link-layer address comes from the Ethernet header
-    data = (void *)(long)skb->data;
-    data_end = (void *)(long)skb->data_end;
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) return TC_ACT_UNSPEC;
+    data = (char *)(long)skb->data;
+    data_end = (char *)(long)skb->data_end;
+    struct ethhdr *eth = (struct ethhdr *)data;
+    if ((char *)(eth + 1) > data_end) return TC_ACT_UNSPEC;
     if (!is_target_solicited_node_mac(eth->h_dest, target)) return TC_ACT_UNSPEC;
 
     struct mac_key_v6 key = {0};
-    __builtin_memcpy(key.addr.bytes, target, sizeof(target));
+    __builtin_memcpy(key.addr.in6_u.u6_addr8, target, sizeof(target));
 
     struct mac_value_v6 value = {0};
     value.ifindex = skb->ingress_ifindex;
@@ -214,7 +251,7 @@ int tc_lan_dao(struct __sk_buff *skb) {
     // Only insert when no binding exists yet, so an authoritative binding
     // (neigh/FIB learning, userspace) is never overwritten by a DAD frame.
     if (bpf_map_update_elem(&ip_mac_v6, &key, &value, BPF_NOEXIST) == 0) {
-        ld_bpf_log("learn DAD NS target: %pI6, ifindex: %d", target, value.ifindex);
+        ld_from_lan_log("learn DAD NS target: %pI6, ifindex: %d", target, value.ifindex);
         emit_ip6_dao_event(value.ifindex, target, eth->h_source);
     } else {
         // Already bound. Re-report whenever a *different* host now re-claims
@@ -224,11 +261,10 @@ int tc_lan_dao(struct __sk_buff *skb) {
         // Same-host re-tests (the common benign case) never trigger an event.
         struct mac_value_v6 *existing = bpf_map_lookup_elem(&ip_mac_v6, &key);
         if (existing && !is_same_mac(existing->mac, eth->h_source)) {
-            ld_bpf_log("re-claim DAD NS target: %pI6, ifindex: %d", target, value.ifindex);
+            ld_from_lan_log("re-claim DAD NS target: %pI6, ifindex: %d", target, value.ifindex);
             emit_ip6_dao_event(value.ifindex, target, eth->h_source);
         }
     }
 
     return TC_ACT_UNSPEC;
-#undef BPF_LOG_TOPIC
 }

@@ -13,12 +13,15 @@
 
 use std::sync::Arc;
 
+use tokio::sync::broadcast;
+
 use crate::LandscapeMapPath;
 use crate::bpf_error::LdEbpfResult;
-use crate::chain::tc_manager::TcChainManager;
-use crate::chain::xdp_manager::XdpChainManager;
 use crate::maps;
+use crate::maps::wan_trie::dispatcher::WanTrieDispatcher;
 use crate::metric::EbpfMetricSourceFactory;
+use crate::route_backbone::RouteBackbone;
+use crate::xdp_attach::XdpAttach;
 use crate::{dns_result_sink::EbpfDnsResultSink, flow_socket_registrar::EbpfFlowSocketRegistrar};
 
 /// bpffs root directory for `space`.
@@ -54,9 +57,14 @@ pub fn init_map_paths(space: &str) -> LdEbpfResult<Arc<LandscapeMapPath>> {
 #[derive(Clone)]
 pub struct EbpfRuntime {
     pub(crate) paths: Arc<LandscapeMapPath>,
-    pub(crate) tc: Arc<TcChainManager>,
-    pub(crate) xdp: Arc<XdpChainManager>,
+    /// Shared route dispatch substrate (trie, intro seed, exits, root
+    /// prog-array shells) consumed by the LAN/WAN route services and
+    /// every WAN link chain.
+    pub(crate) backbone: Arc<RouteBackbone>,
+    /// Per-iface XDP slot arbitration (native vs SKB fallback).
+    pub(crate) xdp_attach: Arc<XdpAttach>,
     pub(crate) try_native_xdp: Option<Vec<i32>>,
+    static_nat4_tx: broadcast::Sender<()>,
 }
 
 impl EbpfRuntime {
@@ -69,10 +77,39 @@ impl EbpfRuntime {
     ///
     /// The returned runtime exclusively owns `space`.
     pub fn init(space: &str, try_native_xdp: Option<Vec<i32>>) -> LdEbpfResult<Self> {
+        // The WAN dispatch tries live in BPF arenas: the interpreter cannot
+        // run arena programs, so a disabled JIT makes every intro load fail
+        // with EOPNOTSUPP. Warn loudly instead of failing mysteriously.
+        if let Ok(v) = std::fs::read_to_string("/proc/sys/net/core/bpf_jit_enable")
+            && v.trim() == "0"
+        {
+            tracing::error!(
+                "net.core.bpf_jit_enable is 0: BPF arena programs (WAN dispatch trie) \
+                 cannot load on this kernel; enable the JIT sysctl"
+            );
+        }
         let paths = init_map_paths(space)?;
-        let tc = Arc::new(TcChainManager::new(paths.clone())?);
-        let xdp = Arc::new(XdpChainManager::new(paths.clone())?);
-        Ok(Self { paths, tc, xdp, try_native_xdp })
+        let wan_trie = Arc::new(WanTrieDispatcher::new());
+        let backbone = Arc::new(RouteBackbone::new(paths.clone(), wan_trie)?);
+        let xdp_attach = Arc::new(XdpAttach::new(paths.clone(), try_native_xdp.clone()));
+        let (static_nat4_tx, _) = broadcast::channel(16);
+        Ok(Self {
+            paths,
+            backbone,
+            xdp_attach,
+            try_native_xdp,
+            static_nat4_tx,
+        })
+    }
+
+    /// The shared route dispatch substrate.
+    pub fn backbone(&self) -> &Arc<RouteBackbone> {
+        &self.backbone
+    }
+
+    /// The per-iface XDP slot coordinator.
+    pub fn xdp_attach(&self) -> &Arc<XdpAttach> {
+        &self.xdp_attach
     }
 
     /// Shared map pin paths.
@@ -80,14 +117,15 @@ impl EbpfRuntime {
         &self.paths
     }
 
-    /// TC chain manager.
-    pub fn tc(&self) -> &TcChainManager {
-        &self.tc
+    /// Subscribe to static NAT4 configuration update notifications. The
+    /// receiver is expected to re-read the repository before restarting NAT.
+    pub fn subscribe_static_nat4(&self) -> broadcast::Receiver<()> {
+        self.static_nat4_tx.subscribe()
     }
 
-    /// XDP chain manager.
-    pub fn xdp(&self) -> &XdpChainManager {
-        &self.xdp
+    /// Notify listeners that static NAT4 configuration changed.
+    pub fn notify_static_nat4(&self) {
+        let _ = self.static_nat4_tx.send(());
     }
 
     /// Native XDP attach configuration this runtime was built with.
@@ -122,39 +160,18 @@ impl EbpfRuntime {
     // lifetime (guards detach chain state on drop).
     // ─────────────────────────────────────────────────────────────────
 
-    /// PPPoE session capability (attach/teardown + WAN IPv4 binding).
-    pub fn pppoe_dataplane(
-        self: Arc<Self>,
-    ) -> Arc<dyn landscape_common::wan_service::pppoe::PppoeDataplane> {
-        Arc::new(crate::runtime_impls::EbpfPppoeDataplane::new(self))
-    }
-
-    /// WAN address binding capability (`wan_ip_binding` map).
-    pub fn wan_addr_binding(
-        self: Arc<Self>,
-    ) -> Arc<dyn landscape_common::wan_service::addr_binding::WanAddrBinding> {
-        Arc::new(crate::runtime_impls::EbpfWanAddrBinding::new(self))
-    }
-
-    /// Firewall capability (stage attach + blacklist sync).
+    /// Firewall capability (blacklist sync).
     pub fn firewall(
         self: Arc<Self>,
     ) -> Arc<dyn landscape_common::wan_service::firewall::dataplane::FirewallDataplane> {
         Arc::new(crate::runtime_impls::EbpfFirewallDataplane::new(self))
     }
 
-    /// NAT capability (stage attach + static mapping sync).
+    /// NAT capability (static mapping sync).
     pub fn nat(
         self: Arc<Self>,
     ) -> Arc<dyn landscape_common::wan_service::nat::dataplane::NatDataplane> {
         Arc::new(crate::runtime_impls::EbpfNatDataplane::new(self))
-    }
-
-    /// MSS clamp capability (stage attach).
-    pub fn mss_clamp(
-        self: Arc<Self>,
-    ) -> Arc<dyn landscape_common::wan_service::mss_clamp::dataplane::MssClampDataplane> {
-        Arc::new(crate::runtime_impls::EbpfMssClampDataplane::new(self))
     }
 
     /// LAN route chain capability.
