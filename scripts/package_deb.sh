@@ -124,7 +124,7 @@ Architecture: $DEB_ARCH
 Maintainer: Landscape contributors <https://github.com/ThisSeanZhang/landscape/issues>
 Installed-Size: $INSTALLED_SIZE
 Depends: $DEPENDS
-Suggests: ppp, hostapd, iw, docker.io
+Suggests: ppp, hostapd, iw, docker.io | docker-ce | podman-docker
 Section: net
 Priority: optional
 Homepage: https://github.com/ThisSeanZhang/landscape
